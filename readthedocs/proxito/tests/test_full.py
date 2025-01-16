@@ -109,6 +109,17 @@ class TestFullDocServing(BaseDocServing):
             "/proxito/media/html/translation/latest/awesome.html",
         )
 
+    def test_translation_zh_deprecated_code_serving(self):
+        self.translation.language = "zh"
+        self.translation.save()
+        url = "/zh/latest/awesome.html"
+        host = "project.dev.readthedocs.io"
+        resp = self.client.get(url, headers={"host": host})
+        self.assertEqual(
+            resp["x-accel-redirect"],
+            "/proxito/media/html/translation/latest/awesome.html",
+        )
+
     def test_normal_serving(self):
         url = "/en/latest/awesome.html"
         host = "project.dev.readthedocs.io"
@@ -983,32 +994,6 @@ class TestAdditionalDocViews(BaseDocServing):
             "/en/latest/",
         )
 
-    @mock.patch.object(BuildMediaFileSystemStorageTest, "open")
-    def test_directory_indexes_readme_serving(self, storage_open):
-        self.project.versions.update(active=True, built=True)
-
-        get(
-            HTMLFile,
-            project=self.project,
-            version=self.version,
-            path="readme-exists/README.html",
-            name="README.html",
-        )
-
-        # Confirm we've serving from storage for the `index-exists/index.html` file
-        response = self.client.get(
-            reverse(
-                "proxito_404_handler",
-                kwargs={"proxito_path": "/en/latest/readme-exists"},
-            ),
-            headers={"host": "project.readthedocs.io"},
-        )
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(
-            response["location"],
-            "/en/latest/readme-exists/README.html",
-        )
-
     def test_directory_indexes_get_args(self):
         self.project.versions.update(active=True, built=True)
         get(
@@ -1063,71 +1048,6 @@ class TestAdditionalDocViews(BaseDocServing):
         )
         self.assertEqual(response.status_code, 404)
         storage_open.assert_called_once_with("html/project/fancy-version/404.html")
-
-    def test_redirects_to_correct_index_ending_with_slash(self):
-        """When the path ends with a slash, we try README.html as index."""
-        self.project.versions.update(active=True, built=True)
-        version = fixture.get(
-            Version,
-            slug="fancy-version",
-            privacy_level=constants.PUBLIC,
-            active=True,
-            built=True,
-            project=self.project,
-            documentation_type=SPHINX,
-        )
-
-        get(
-            HTMLFile,
-            project=self.project,
-            version=version,
-            path="not-found/README.html",
-            name="README.html",
-        )
-        response = self.client.get(
-            reverse(
-                "proxito_404_handler",
-                kwargs={"proxito_path": "/en/fancy-version/not-found/"},
-            ),
-            headers={"host": "project.readthedocs.io"},
-        )
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(
-            response["location"], "/en/fancy-version/not-found/README.html"
-        )
-
-    def test_redirects_to_correct_index_ending_without_slash(self):
-        """When the path doesn't end with a slash, we try both, index.html and README.html."""
-        self.project.versions.update(active=True, built=True)
-        version = fixture.get(
-            Version,
-            slug="fancy-version",
-            privacy_level=constants.PUBLIC,
-            active=True,
-            built=True,
-            project=self.project,
-            documentation_type=SPHINX,
-        )
-
-        get(
-            HTMLFile,
-            project=self.project,
-            version=version,
-            path="not-found/README.html",
-            name="README.html",
-        )
-
-        response = self.client.get(
-            reverse(
-                "proxito_404_handler",
-                kwargs={"proxito_path": "/en/fancy-version/not-found"},
-            ),
-            headers={"host": "project.readthedocs.io"},
-        )
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(
-            response["location"], "/en/fancy-version/not-found/README.html"
-        )
 
     @mock.patch.object(BuildMediaFileSystemStorageTest, "open")
     def test_404_index_redirect_skips_not_built_versions(self, storage_open):
@@ -1634,6 +1554,17 @@ class TestAdditionalDocViews(BaseDocServing):
             active=True,
             type=EXTERNAL,
         )
+
+        hidden_version = fixture.get(
+            Version,
+            identifier="hidden-version",
+            verbose_name="hidden-version",
+            slug="hidden-version",
+            privacy_level=constants.PUBLIC,
+            project=self.project,
+            active=True,
+            hidden=True,
+        )
         # This also creates a Version `latest` Automatically for this project
         translation = fixture.get(
             Project,
@@ -1660,7 +1591,8 @@ class TestAdditionalDocViews(BaseDocServing):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response["Content-Type"], "application/xml")
         for version in self.project.versions(manager=INTERNAL).filter(
-            privacy_level=constants.PUBLIC
+            privacy_level=constants.PUBLIC,
+            hidden=False,
         ):
             self.assertContains(
                 response,
@@ -1678,6 +1610,16 @@ class TestAdditionalDocViews(BaseDocServing):
                 lang_slug=self.project.language,
             ),
         )
+
+        # Hidden version should not appear here
+        self.assertNotContains(
+            response,
+            self.project.get_docs_url(
+                version_slug=hidden_version.slug,
+                lang_slug=self.project.language,
+            ),
+        )
+
         # The `translation` project doesn't have a version named `not-translated-version`
         # so, the sitemap should not have a doc url for
         # `not-translated-version` with `translation-es` language.
@@ -1805,7 +1747,7 @@ class TestAdditionalDocViews(BaseDocServing):
     ALLOW_PRIVATE_REPOS=True,
     PUBLIC_DOMAIN="dev.readthedocs.io",
     PUBLIC_DOMAIN_USES_HTTPS=True,
-    RTD_DEFAULT_FEATURES=dict([RTDProductFeature(type=TYPE_CNAME).to_item()]),
+    RTD_DEFAULT_FEATURES=dict([RTDProductFeature(type=TYPE_CNAME, value=2).to_item()]),
 )
 # We are overriding the storage class instead of using RTD_BUILD_MEDIA_STORAGE,
 # since the setting is evaluated just once (first test to use the storage

@@ -97,8 +97,21 @@ BUILD_MESSAGES = [
         type=ERROR,
     ),
     Message(
+        id=BuildAppError.UPLOAD_FAILED,
+        header=_("There was a problem while updating your documentation"),
+        body=_(
+            textwrap.dedent(
+                """
+                Make sure this project is outputting files to the correct directory, or try again later.
+                If this problem persists, report this error to us with your build id ({{ instance.pk }}).
+                """
+            ).strip(),
+        ),
+        type=ERROR,
+    ),
+    Message(
         id=BuildAppError.BUILD_TERMINATED_DUE_INACTIVITY,
-        header=_("Build terminated due inactivity"),
+        header=_("Build terminated due to inactivity"),
         body=_(
             textwrap.dedent(
                 """
@@ -232,8 +245,9 @@ BUILD_MESSAGES = [
         header=_("No HTML content found"),
         body=_(
             textwrap.dedent(
-                f"""
-             No "{BUILD_COMMANDS_OUTPUT_PATH_HTML}" folder was created during this build.
+                """
+             No content was output to the path "$READTHEDOCS_OUTPUT/html".
+             Read more about <a href="https://docs.readthedocs.io/page/build-customization.html#where-to-put-files">where to put your built files</a>.
              """
             ).strip(),
         ),

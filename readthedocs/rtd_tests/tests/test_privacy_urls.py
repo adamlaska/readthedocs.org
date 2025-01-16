@@ -324,6 +324,9 @@ class PrivateProjectAdminAccessTest(PrivateProjectMixin, TestCase):
         "/dashboard/pip/rules/{automation_rule_id}/delete/": {"status_code": 405},
         "/dashboard/pip/rules/{automation_rule_id}/move/{steps}/": {"status_code": 405},
         "/dashboard/pip/webhooks/{webhook_id}/delete/": {"status_code": 405},
+        # Placeholder URLs.
+        "/dashboard/pip/sharing/": {"status_code": 404},
+        "/dashboard/pip/keys/": {"status_code": 404},
     }
 
     def get_url_path_ctx(self):
@@ -401,6 +404,12 @@ class PrivateProjectUnauthAccessTest(PrivateProjectMixin, TestCase):
     # Auth protected
     default_status_code = 302
 
+    response_data = {
+        # Placeholder URLs.
+        "/dashboard/pip/sharing/": {"status_code": 404},
+        "/dashboard/pip/keys/": {"status_code": 404},
+    }
+
     def login(self):
         pass
 
@@ -430,9 +439,6 @@ class APIMixin(URLAccessMixin):
             "buildcommandresult-detail": {"pk": self.build_command_result.pk},
             "version-detail": {"pk": self.pip.versions.all()[0].pk},
             "domain-detail": {"pk": self.domain.pk},
-            "footer_html": {
-                "data": {"project": "pip", "version": "latest", "page": "index"}
-            },
             "remoteorganization-detail": {"pk": self.remote_org.pk},
             "remoterepository-detail": {"pk": self.remote_repo.pk},
             "remoteaccount-detail": {"pk": self.social_account.pk},

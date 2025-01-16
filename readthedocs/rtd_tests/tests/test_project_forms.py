@@ -1,6 +1,7 @@
 from unittest import mock
 
 from allauth.socialaccount.models import SocialAccount
+from allauth.socialaccount.providers.github.provider import GitHubProvider
 from django.contrib.auth.models import User
 from django.core.exceptions import NON_FIELD_ERRORS
 from django.test import TestCase
@@ -10,6 +11,7 @@ from django_dynamic_fixture import get
 from readthedocs.builds.constants import EXTERNAL, LATEST, STABLE
 from readthedocs.builds.models import Version
 from readthedocs.core.forms import RichValidationError
+from readthedocs.oauth.models import RemoteRepository, RemoteRepositoryRelation
 from readthedocs.organizations.models import Organization, Team
 from readthedocs.projects.constants import (
     ADDONS_FLYOUT_SORTING_CALVER,
@@ -18,8 +20,6 @@ from readthedocs.projects.constants import (
     MULTIPLE_VERSIONS_WITHOUT_TRANSLATIONS,
     PRIVATE,
     PUBLIC,
-    REPO_TYPE_GIT,
-    REPO_TYPE_HG,
     SINGLE_VERSION_WITHOUT_TRANSLATIONS,
     SPHINX,
 )
@@ -35,6 +35,7 @@ from readthedocs.projects.forms import (
     WebHookForm,
 )
 from readthedocs.projects.models import EnvironmentVariable, Project, WebHookEvent
+from readthedocs.projects.validators import MAX_SIZE_ENV_VARS_PER_PROJECT
 
 
 class TestProjectForms(TestCase):
@@ -113,29 +114,6 @@ class TestProjectForms(TestCase):
         self.assertFalse(form.is_valid())
         self.assertIn("name", form.errors)
 
-    def test_changing_vcs_should_not_change_latest_is_not_none(self):
-        """
-        When changing the project's VCS,
-        we should respect the custom default branch.
-        """
-        project = get(Project, repo_type=REPO_TYPE_HG, default_branch="custom")
-        latest = project.versions.get(slug=LATEST)
-        self.assertEqual(latest.identifier, "custom")
-
-        form = ProjectBasicsForm(
-            {
-                "repo": "http://github.com/test/test",
-                "name": "name",
-                "repo_type": REPO_TYPE_GIT,
-                "language": "en",
-            },
-            instance=project,
-        )
-        self.assertTrue(form.is_valid())
-        form.save()
-        latest.refresh_from_db()
-        self.assertEqual(latest.identifier, "custom")
-
     @override_settings(ALLOW_PRIVATE_REPOS=False)
     def test_length_of_tags(self):
         project = get(Project)
@@ -180,7 +158,8 @@ class TestProjectForms(TestCase):
 
 class TestProjectAdvancedForm(TestCase):
     def setUp(self):
-        self.project = get(Project, privacy_level=PUBLIC)
+        self.user = get(User)
+        self.project = get(Project, privacy_level=PUBLIC, users=[self.user])
         get(
             Version,
             project=self.project,
@@ -357,6 +336,55 @@ class TestProjectAdvancedForm(TestCase):
             version=default_branch,
         )
 
+    def test_set_remote_repository(self):
+        data = {
+            "name": "Project",
+            "repo": "https://github.com/readthedocs/readthedocs.org/",
+            "repo_type": self.project.repo_type,
+            "default_version": LATEST,
+            "language": self.project.language,
+            "versioning_scheme": self.project.versioning_scheme,
+        }
+
+        remote_repository = get(
+            RemoteRepository,
+            full_name="rtfd/template",
+            clone_url="https://github.com/rtfd/template",
+            html_url="https://github.com/rtfd/template",
+            ssh_url="git@github.com:rtfd/template.git",
+            private=False,
+        )
+
+        # No remote repository attached.
+        form = UpdateProjectForm(data, instance=self.project, user=self.user)
+        self.assertTrue(form.is_valid())
+
+        # Remote repository attached, but it doesn't belong to the user.
+        data["remote_repository"] = remote_repository.pk
+        form = UpdateProjectForm(data, instance=self.project, user=self.user)
+        self.assertFalse(form.is_valid())
+        self.assertIn("remote_repository", form.errors)
+
+        # Remote repository attached, it belongs to the user now.
+        remote_repository_rel = get(
+            RemoteRepositoryRelation,
+            remote_repository=remote_repository,
+            user=self.user,
+            admin=True,
+        )
+        data["remote_repository"] = remote_repository.pk
+        form = UpdateProjectForm(data, instance=self.project, user=self.user)
+        self.assertTrue(form.is_valid())
+
+        # The project has the remote repository attached.
+        # And the user doesn't have access to it anymore, but still can use it.
+        self.project.remote_repository = remote_repository
+        self.project.save()
+        remote_repository_rel.delete()
+        data["remote_repository"] = remote_repository.pk
+        form = UpdateProjectForm(data, instance=self.project, user=self.user)
+        self.assertTrue(form.is_valid())
+
 
 class TestProjectAdvancedFormDefaultBranch(TestCase):
     def setUp(self):
@@ -450,29 +478,6 @@ class TestProjectAdvancedFormDefaultBranch(TestCase):
             ],
         )
 
-    def test_commit_name_not_in_default_branch_choices(self):
-        form = UpdateProjectForm(instance=self.project)
-        # This version is created by the user
-        latest = self.project.versions.filter(slug=LATEST)
-        # This version is created by the user
-        stable = self.project.versions.filter(slug=STABLE)
-
-        # `commit_name` can not be used as the value for the choices
-        self.assertNotIn(
-            latest.first().commit_name,
-            [
-                identifier
-                for identifier, _ in form.fields["default_branch"].widget.choices
-            ],
-        )
-        self.assertNotIn(
-            stable.first().commit_name,
-            [
-                identifier
-                for identifier, _ in form.fields["default_branch"].widget.choices
-            ],
-        )
-
     def test_external_version_not_in_default_branch_choices(self):
         external_version = get(
             Version,
@@ -501,7 +506,9 @@ class TestProjectPrevalidationForms(TestCase):
         # User with connection
         # User without connection
         self.user_github = get(User)
-        self.social_github = get(SocialAccount, user=self.user_github)
+        self.social_github = get(
+            SocialAccount, user=self.user_github, provider=GitHubProvider.id
+        )
         self.user_email = get(User)
 
     def test_form_prevalidation_email_user(self):
@@ -537,11 +544,17 @@ class TestProjectPrevalidationForms(TestCase):
 class TestProjectPrevalidationFormsWithOrganizations(TestCase):
     def setUp(self):
         self.user_owner = get(User)
-        self.social_owner = get(SocialAccount, user=self.user_owner)
+        self.social_owner = get(
+            SocialAccount, user=self.user_owner, provider=GitHubProvider.id
+        )
         self.user_admin = get(User)
-        self.social_admin = get(SocialAccount, user=self.user_admin)
+        self.social_admin = get(
+            SocialAccount, user=self.user_admin, provider=GitHubProvider.id
+        )
         self.user_readonly = get(User)
-        self.social_readonly = get(SocialAccount, user=self.user_readonly)
+        self.social_readonly = get(
+            SocialAccount, user=self.user_readonly, provider=GitHubProvider.id
+        )
 
         self.organization = get(
             Organization,
@@ -1088,6 +1101,42 @@ class TestProjectEnvironmentVariablesForm(TestCase):
             r"'string escaped here: #$\1[]{}\|'",
         )
 
+    def test_create_env_variable_with_long_value(self):
+        data = {
+            "name": "MYTOKEN",
+            "value": "a" * (48000 + 1),
+        }
+        form = EnvironmentVariableForm(data, project=self.project)
+        assert not form.is_valid()
+        assert form.errors["value"] == [
+            "Ensure this value has at most 48000 characters (it has 48001)."
+        ]
+
+    def test_create_env_variable_over_total_project_size(self):
+        size = 2000
+        for i in range((MAX_SIZE_ENV_VARS_PER_PROJECT - size) // size):
+            get(
+                EnvironmentVariable,
+                project=self.project,
+                name=f"ENVVAR{i}",
+                value="a" * size,
+                public=False,
+            )
+
+        form = EnvironmentVariableForm(
+            {"name": "A", "value": "a" * (size // 2)}, project=self.project
+        )
+        assert form.is_valid()
+        form.save()
+
+        form = EnvironmentVariableForm(
+            {"name": "B", "value": "a" * size}, project=self.project
+        )
+        assert not form.is_valid()
+        assert form.errors["__all__"] == [
+            "The total size of all environment variables in the project cannot exceed 256 KB."
+        ]
+
 
 class TestAddonsConfigForm(TestCase):
     def setUp(self):
@@ -1098,14 +1147,16 @@ class TestAddonsConfigForm(TestCase):
             "enabled": True,
             "analytics_enabled": False,
             "doc_diff_enabled": False,
-            "external_version_warning_enabled": True,
             "flyout_enabled": True,
             "flyout_sorting": ADDONS_FLYOUT_SORTING_CALVER,
             "flyout_sorting_latest_stable_at_beginning": True,
             "flyout_sorting_custom_pattern": None,
             "hotkeys_enabled": False,
             "search_enabled": False,
-            "stable_latest_version_warning_enabled": True,
+            "notifications_enabled": True,
+            "notifications_show_on_latest": True,
+            "notifications_show_on_non_stable": True,
+            "notifications_show_on_external": True,
         }
         form = AddonsConfigForm(data=data, project=self.project)
         self.assertTrue(form.is_valid())
@@ -1114,7 +1165,10 @@ class TestAddonsConfigForm(TestCase):
         self.assertEqual(self.project.addons.enabled, True)
         self.assertEqual(self.project.addons.analytics_enabled, False)
         self.assertEqual(self.project.addons.doc_diff_enabled, False)
-        self.assertEqual(self.project.addons.external_version_warning_enabled, True)
+        self.assertEqual(self.project.addons.notifications_enabled, True)
+        self.assertEqual(self.project.addons.notifications_show_on_latest, True)
+        self.assertEqual(self.project.addons.notifications_show_on_non_stable, True)
+        self.assertEqual(self.project.addons.notifications_show_on_external, True)
         self.assertEqual(self.project.addons.flyout_enabled, True)
         self.assertEqual(
             self.project.addons.flyout_sorting,
@@ -1127,24 +1181,25 @@ class TestAddonsConfigForm(TestCase):
         self.assertEqual(self.project.addons.flyout_sorting_custom_pattern, None)
         self.assertEqual(self.project.addons.hotkeys_enabled, False)
         self.assertEqual(self.project.addons.search_enabled, False)
-        self.assertEqual(
-            self.project.addons.stable_latest_version_warning_enabled,
-            True,
-        )
+        self.assertEqual(self.project.addons.notifications_show_on_latest, True)
+        self.assertEqual(self.project.addons.notifications_show_on_non_stable, True)
+        self.assertEqual(self.project.addons.notifications_show_on_external, True)
 
     def test_addonsconfig_form_invalid_sorting_custom_pattern(self):
         data = {
             "enabled": True,
             "analytics_enabled": False,
             "doc_diff_enabled": False,
-            "external_version_warning_enabled": True,
             "flyout_enabled": True,
             "flyout_sorting": ADDONS_FLYOUT_SORTING_CUSTOM_PATTERN,
             "flyout_sorting_latest_stable_at_beginning": True,
             "flyout_sorting_custom_pattern": None,
             "hotkeys_enabled": False,
             "search_enabled": False,
-            "stable_latest_version_warning_enabled": True,
+            "notifications_enabled": True,
+            "notifications_show_on_latest": True,
+            "notifications_show_on_non_stable": True,
+            "notifications_show_on_external": True,
         }
         form = AddonsConfigForm(data=data, project=self.project)
         self.assertFalse(form.is_valid())

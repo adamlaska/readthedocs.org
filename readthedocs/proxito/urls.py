@@ -33,12 +33,14 @@ pip.rtfd.io/<lang>/
 pip.rtd.io/_/api/*
 """
 
+from functools import reduce
+from operator import add
+
 from django.conf import settings
 from django.urls import include, path, re_path
-from django.views import defaults
 
 from readthedocs.constants import pattern_opts
-from readthedocs.core.views import HealthCheckView, TeapotView
+from readthedocs.core.views import HealthCheckView
 from readthedocs.projects.views.public import ProjectDownloadMedia
 from readthedocs.proxito.views.hosting import ReadTheDocsConfigJson
 from readthedocs.proxito.views.serve import (
@@ -49,7 +51,7 @@ from readthedocs.proxito.views.serve import (
     ServeSitemapXML,
     ServeStaticFiles,
 )
-from readthedocs.proxito.views.utils import proxito_404_page_handler
+from readthedocs.proxito.views.utils import ProxitoErrorView, proxito_404_page_handler
 
 DOC_PATH_PREFIX = getattr(settings, "DOC_PATH_PREFIX", "")
 
@@ -119,13 +121,6 @@ proxied_urls = [
         ReadTheDocsConfigJson.as_view(),
         name="proxito_readthedocs_docs_addons",
     ),
-    # TODO: remove `readthedocs-config/` endpoint once we have changed the URL
-    # in the js and we have deployed it.
-    path(
-        f"{DOC_PATH_PREFIX}readthedocs-config/",
-        ReadTheDocsConfigJson.as_view(),
-        name="proxito_readthedocs_config_json",
-    ),
 ]
 
 core_urls = [
@@ -158,46 +153,76 @@ docs_urls = [
 # this point. We can come back later here if we need them.
 # See https://github.com/readthedocs/readthedocs-ops/issues/1323
 dummy_dashboard_urls = [
-    # /dashboard/<project_slug>/
+    # /projects/<project_slug>/
     re_path(
-        r"^(?P<project_slug>{project_slug})/$".format(**pattern_opts),
-        TeapotView.as_view(),
+        r"^projects/(?P<project_slug>{project_slug})/$".format(**pattern_opts),
+        ProxitoErrorView.as_view(status_code=418),
         name="projects_detail",
     ),
-    # /dashboard/<project_slug>/builds/
+    # /projects/<project_slug>/builds/
     re_path(
-        (r"^(?P<project_slug>{project_slug})/builds/$".format(**pattern_opts)),
-        TeapotView.as_view(),
+        (r"^projects/(?P<project_slug>{project_slug})/builds/$".format(**pattern_opts)),
+        ProxitoErrorView.as_view(status_code=418),
         name="builds_project_list",
     ),
-    # /dashboard/<project_slug>/versions/
+    # /projects/<project_slug>/versions/
     re_path(
-        r"^(?P<project_slug>{project_slug})/versions/$".format(**pattern_opts),
-        TeapotView.as_view(),
+        r"^projects/(?P<project_slug>{project_slug})/versions/$".format(**pattern_opts),
+        ProxitoErrorView.as_view(status_code=418),
         name="project_version_list",
     ),
-    # /dashboard/<project_slug>/builds/<build_id>/
+    # /projects/<project_slug>/downloads/
     re_path(
         (
-            r"^(?P<project_slug>{project_slug})/builds/(?P<build_pk>\d+)/$".format(
+            r"^projects/(?P<project_slug>{project_slug})/downloads/$".format(
                 **pattern_opts
             )
         ),
-        TeapotView.as_view(),
+        ProxitoErrorView.as_view(status_code=418),
+        name="project_downloads",
+    ),
+    # /projects/<project_slug>/builds/<build_id>/
+    re_path(
+        (
+            r"^projects/(?P<project_slug>{project_slug})/builds/(?P<build_pk>\d+)/$".format(
+                **pattern_opts
+            )
+        ),
+        ProxitoErrorView.as_view(status_code=418),
         name="builds_detail",
     ),
-    # /dashboard/<project_slug>/version/<version_slug>/
+    # /projects/<project_slug>/version/<version_slug>/
     re_path(
-        r"^(?P<project_slug>[-\w]+)/version/(?P<version_slug>[^/]+)/edit/$",
-        TeapotView.as_view(),
+        r"^projects/(?P<project_slug>[-\w]+)/version/(?P<version_slug>[^/]+)/edit/$",
+        ProxitoErrorView.as_view(status_code=418),
         name="project_version_detail",
     ),
 ]
 
-urlpatterns = (
-    health_check_urls + proxied_urls + core_urls + docs_urls + dummy_dashboard_urls
-)
+debug_urls = [
+    # For testing error responses and templates
+    re_path(
+        r"^{DOC_PATH_PREFIX}error/(?P<template_name>.*)$".format(
+            DOC_PATH_PREFIX=DOC_PATH_PREFIX,
+        ),
+        ProxitoErrorView.as_view(),
+    ),
+]
+
+groups = [
+    health_check_urls,
+    proxied_urls,
+    core_urls,
+    docs_urls,
+    # Fallback paths only required for resolving URLs, evaluate these last
+    dummy_dashboard_urls,
+]
+
+if settings.SHOW_DEBUG_TOOLBAR:
+    groups.insert(0, debug_urls)
+
+urlpatterns = reduce(add, groups)
 
 # Use Django default error handlers to make things simpler
 handler404 = proxito_404_page_handler
-handler500 = defaults.server_error
+handler500 = ProxitoErrorView.as_view(status_code=500)

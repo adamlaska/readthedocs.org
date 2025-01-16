@@ -14,8 +14,10 @@ from corsheaders.defaults import default_headers
 from readthedocs.core.settings import Settings
 from readthedocs.builds import constants_docker
 
+from django.conf.global_settings import PASSWORD_HASHERS
+
 try:
-    import readthedocsext  # noqa
+    import readthedocsext.cdn  # noqa
 
     ext = True
 except ImportError:
@@ -61,6 +63,17 @@ class CommunityBaseSettings(Settings):
 
         return {
             "SHOW_TOOLBAR_CALLBACK": _show_debug_toolbar,
+            "DISABLE_PANELS": [
+                # Default ones
+                "debug_toolbar.panels.profiling.ProfilingPanel",
+                "debug_toolbar.panels.redirects.RedirectsPanel",
+                # Custome ones
+                # We are disabling these because they take a lot of time to execute in the new dashboard.
+                # We make an intensive usage of the ``include`` template tag there.
+                # It's a "known issue/bug" and there is no solution as far as we can tell.
+                "debug_toolbar.panels.sql.SQLPanel",
+                "debug_toolbar.panels.templates.TemplatesPanel",
+            ]
         }
 
     @property
@@ -84,6 +97,12 @@ class CommunityBaseSettings(Settings):
     RTD_INTERSPHINX_URL = "https://{}".format(PRODUCTION_DOMAIN)
     RTD_EXTERNAL_VERSION_DOMAIN = "external-builds.readthedocs.io"
 
+    @property
+    def SWITCH_PRODUCTION_DOMAIN(self):
+        if self.RTD_EXT_THEME_ENABLED:
+            return self.PRODUCTION_DOMAIN.removeprefix("app.")
+        return f"app.{self.PRODUCTION_DOMAIN}"
+
     # Doc Builder Backends
     MKDOCS_BACKEND = "readthedocs.doc_builder.backends.mkdocs"
     SPHINX_BACKEND = "readthedocs.doc_builder.backends.sphinx"
@@ -102,16 +121,7 @@ class CommunityBaseSettings(Settings):
     SESSION_COOKIE_HTTPONLY = True
     SESSION_COOKIE_AGE = 30 * 24 * 60 * 60  # 30 days
     SESSION_SAVE_EVERY_REQUEST = False
-
-    @property
-    def SESSION_COOKIE_SAMESITE(self):
-        """
-        Cookie used in cross-origin API requests from *.rtd.io to rtd.org/api/v2/sustainability/.
-        """
-        if self.USE_PROMOS:
-            return None
-        # This is django's default.
-        return "Lax"
+    SESSION_COOKIE_SAMESITE = "Lax"
 
     # CSRF
     CSRF_COOKIE_HTTPONLY = True
@@ -125,7 +135,6 @@ class CommunityBaseSettings(Settings):
 
     # Content Security Policy
     # https://django-csp.readthedocs.io/
-    CSP_BLOCK_ALL_MIXED_CONTENT = True
     CSP_DEFAULT_SRC = None  # This could be improved
     CSP_FRAME_ANCESTORS = ("'none'",)
     CSP_OBJECT_SRC = ("'none'",)
@@ -169,7 +178,8 @@ class CommunityBaseSettings(Settings):
 
         return dict(
             (
-                RTDProductFeature(type=constants.TYPE_CNAME).to_item(),
+                # Max number of domains allowed per project.
+                RTDProductFeature(type=constants.TYPE_CNAME, value=2).to_item(),
                 RTDProductFeature(type=constants.TYPE_EMBED_API).to_item(),
                 # Retention days for search analytics.
                 RTDProductFeature(
@@ -285,8 +295,13 @@ class CommunityBaseSettings(Settings):
             "allauth.socialaccount",
             "allauth.socialaccount.providers.github",
             "allauth.socialaccount.providers.gitlab",
-            "allauth.socialaccount.providers.bitbucket",
             "allauth.socialaccount.providers.bitbucket_oauth2",
+            "allauth.mfa",
+            # Others
+            # NOTE: impersonate functionality is only enabled when ALLOW_ADMIN is True,
+            # but we still need to include it even when not enabled, since it has objects
+            # related to the user model that Django needs to know about when deleting users.
+            "impersonate",
             "cacheops",
         ]
         if ext:
@@ -320,7 +335,7 @@ class CommunityBaseSettings(Settings):
     def MIDDLEWARE(self):
         middlewares = [
             "readthedocs.core.middleware.NullCharactersMiddleware",
-            "readthedocs.core.middleware.ReadTheDocsSessionMiddleware",
+            "django.contrib.sessions.middleware.SessionMiddleware",
             "django.middleware.locale.LocaleMiddleware",
             "corsheaders.middleware.CorsMiddleware",
             "django.middleware.common.CommonMiddleware",
@@ -332,13 +347,14 @@ class CommunityBaseSettings(Settings):
             "allauth.account.middleware.AccountMiddleware",
             "dj_pagination.middleware.PaginationMiddleware",
             "csp.middleware.CSPMiddleware",
-            "readthedocs.core.middleware.ReferrerPolicyMiddleware",
             "simple_history.middleware.HistoryRequestMiddleware",
             "readthedocs.core.logs.ReadTheDocsRequestMiddleware",
             "django_structlog.middlewares.CeleryMiddleware",
         ]
         if self.SHOW_DEBUG_TOOLBAR:
             middlewares.insert(0, "debug_toolbar.middleware.DebugToolbarMiddleware")
+        if self.ALLOW_ADMIN:
+            middlewares.append("impersonate.middleware.ImpersonateMiddleware")
         return middlewares
 
     AUTHENTICATION_BACKENDS = (
@@ -366,6 +382,10 @@ class CommunityBaseSettings(Settings):
         },
     ]
 
+    # Explicitly set the password hashers to the default ones,
+    # so we can change them in our test settings.
+    PASSWORD_HASHERS = PASSWORD_HASHERS
+
     # Paths
     SITE_ROOT = os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -382,6 +402,7 @@ class CommunityBaseSettings(Settings):
     MEDIA_ROOT = os.path.join(SITE_ROOT, "media/")
     MEDIA_URL = "/media/"
     ADMIN_MEDIA_PREFIX = "/media/admin/"
+    ADMIN_URL = "/admin"
     STATICFILES_DIRS = [
         os.path.join(SITE_ROOT, "readthedocs", "static"),
         os.path.join(SITE_ROOT, "media"),
@@ -540,11 +561,11 @@ class CommunityBaseSettings(Settings):
                 "delete": True,
             },
         },
-        "every-three-hours-delete-inactive-external-versions": {
+        "every-30m-delete-inactive-external-versions": {
             "task": "readthedocs.builds.tasks.delete_closed_external_versions",
             # Increase the frequency because we have 255k closed versions and they keep growing.
             # It's better to increase this frequency than the `limit=` of the task.
-            "schedule": crontab(minute=0, hour="*/3"),
+            "schedule": crontab(minute="*/30", hour="*"),
             "options": {"queue": "web"},
         },
         "every-day-resync-remote-repositories": {
@@ -633,8 +654,8 @@ class CommunityBaseSettings(Settings):
         """
         # Our normal default
         limits = {
-            "memory": "1g",
-            "time": 600,
+            "memory": "2g",
+            "time": 900,
         }
 
         # Only run on our servers
@@ -656,13 +677,19 @@ class CommunityBaseSettings(Settings):
         )
         return limits
 
-    # All auth
+    # Allauth
     ACCOUNT_ADAPTER = "readthedocs.core.adapters.AccountAdapter"
     ACCOUNT_EMAIL_REQUIRED = True
+    # By preventing enumeration, we will always send an email,
+    # even if the email is not registered, that's hurting
+    # our email reputation. We are okay with people knowing
+    # if an email is registered or not.
+    ACCOUNT_PREVENT_ENUMERATION = False
 
     # Make email verification mandatory.
     # Users won't be able to login until they verify the email address.
     ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+    ACCOUNT_LOGIN_ON_EMAIL_CONFIRMATION = True
 
     ACCOUNT_AUTHENTICATION_METHOD = "username_email"
     ACCOUNT_EMAIL_CONFIRMATION_EXPIRE_DAYS = 7
@@ -698,12 +725,6 @@ class CommunityBaseSettings(Settings):
             ],
             # Bitbucket scope/permissions are determined by the Oauth consumer setup on bitbucket.org.
         },
-        # Deprecated, we use `bitbucket_oauth2` for all new connections.
-        "bitbucket": {
-            "APPS": [
-                {"client_id": "123", "secret": "456", "key": ""},
-            ],
-        },
     }
 
     @property
@@ -722,17 +743,12 @@ class CommunityBaseSettings(Settings):
     # CORS
     # Don't allow sending cookies in cross-domain requests, this is so we can
     # relax our CORS headers for more views, but at the same time not opening
-    # users to CSRF attacks. The sustainability API is the only view that requires
-    # cookies to be send cross-site, we override that for that view only.
+    # users to CSRF attacks.
     CORS_ALLOW_CREDENTIALS = False
 
     # Allow cross-site requests from any origin,
     # all information from our allowed endpoits is public.
-    #
-    # NOTE: We don't use `CORS_ALLOW_ALL_ORIGINS=True`,
-    # since that will set the `Access-Control-Allow-Origin` header to `*`,
-    # we won't be able to pass credentials fo the sustainability API with that value.
-    CORS_ALLOWED_ORIGIN_REGEXES = [re.compile(".+")]
+    CORS_ALLOW_ALL_ORIGINS = True
     CORS_ALLOW_HEADERS = list(default_headers) + [
         "x-hoverxref-version",
     ]
@@ -747,8 +763,7 @@ class CommunityBaseSettings(Settings):
     CORS_URLS_REGEX = re.compile(
         r"""
         ^(
-            /api/v2/footer_html
-            |/api/v2/search
+            /api/v2/search
             |/api/v2/docsearch
             |/api/v2/embed
             |/api/v3/embed
@@ -822,6 +837,12 @@ class CommunityBaseSettings(Settings):
 
     INTERNAL_IPS = ("127.0.0.1",)
 
+    # django-impersonate.
+    IMPERSONATE = {
+        # By default, only staff users can impersonate.
+        "REQUIRE_SUPERUSER": True,
+    }
+
     # Taggit
     # https://django-taggit.readthedocs.io
     TAGGIT_TAGS_FROM_STRING = "readthedocs.projects.tag_utils.rtd_parse_tags"
@@ -852,6 +873,10 @@ class CommunityBaseSettings(Settings):
     # since we have subscriptions attached to an organization or gold user
     # we can't make use of the DJSTRIPE_SUBSCRIBER_MODEL setting.
     DJSTRIPE_SUBSCRIBER_CUSTOMER_KEY = None
+
+    # Webhook URL for BotDog to post messages in Slack #sales channel:
+    # https://api.slack.com/apps/A01ML7J7N4T/incoming-webhooks
+    SLACK_WEBHOOK_SALES_CHANNEL = None  # https://hooks.slack.com/services/...
 
     # Do Not Track support
     DO_NOT_TRACK_ENABLED = False
@@ -1006,6 +1031,7 @@ class CommunityBaseSettings(Settings):
     RTD_SPAM_THRESHOLD_DENY_ON_ROBOTS = 200
     RTD_SPAM_THRESHOLD_DONT_SHOW_DASHBOARD = 300
     RTD_SPAM_THRESHOLD_DONT_SERVE_DOCS = 500
+    RTD_SPAM_THRESHOLD_REMOVE_FROM_SEARCH_INDEX = 500
     RTD_SPAM_THRESHOLD_DELETE_PROJECT = 1000
     RTD_SPAM_MAX_SCORE = 9999
 
@@ -1047,3 +1073,5 @@ class CommunityBaseSettings(Settings):
             "timeout": CACHEOPS_TIMEOUT,
         },
     }
+
+    S3_PROVIDER = "AWS"

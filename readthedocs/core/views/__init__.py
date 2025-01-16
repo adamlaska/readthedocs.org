@@ -7,7 +7,7 @@ and server errors.
 
 import structlog
 from django.conf import settings
-from django.http import JsonResponse
+from django.http import Http404, JsonResponse
 from django.shortcuts import redirect
 from django.urls import reverse
 from django.views.generic import TemplateView, View
@@ -93,6 +93,8 @@ class ErrorView(TemplateView):
     multiple subpaths for errors, as we need to show application themed errors
     for dashboard users and minimal error pages for documentation readers.
 
+    Template resolution also uses fallback to generic 4xx/5xx error templates.
+
     View arguments:
 
     status_code
@@ -105,33 +107,31 @@ class ErrorView(TemplateView):
         separate path from Proxito error templates.
     """
 
-    base_path = "errors/dashboard/"
-    status_code = 500
+    base_path = "errors/dashboard"
+    status_code = None
+    template_name = None
 
     def get_status_code(self):
-        status_code = self.status_code
-        try:
-            status_code = int(self.kwargs["status_code"])
-        except (ValueError, KeyError):
-            pass
-        return status_code
+        return self.kwargs.get("status_code", self.status_code)
+
+    def get_template_name(self):
+        return self.kwargs.get("template_name", self.template_name)
 
     def get_template_names(self):
-        status_code = self.get_status_code()
-        if settings.RTD_EXT_THEME_ENABLED:
-            # First try to load the template for the specific HTTP status code
-            # and fall back to a generic 400/500 level error template
-            status_code_class = int(status_code / 100)
-            generic_code = f"{status_code_class}xx"
-            return [
-                f"{self.base_path}/{code}.html" for code in [status_code, generic_code]
-            ]
-        # TODO the legacy dashboard has top level path errors, as is the
-        # default. This can be removed later.
-        return f"{status_code}.html"
+        template_names = []
+        if (template_name := self.get_template_name()) is not None:
+            template_names.append(template_name.rstrip("/"))
+        if (status_code := self.get_status_code()) is not None:
+            template_names.append(str(status_code))
+        return [f"{self.base_path}/{file}.html" for file in template_names]
+
+    def get_context_data(self, **kwargs):
+        context_data = super().get_context_data(**kwargs)
+        context_data["status_code"] = self.get_status_code()
+        return context_data
 
     def dispatch(self, request, *args, **kwargs):
-        context = self.get_context_data(**kwargs)
+        context = self.get_context_data()
         status_code = self.get_status_code()
         return self.render_to_response(
             context,
@@ -139,13 +139,12 @@ class ErrorView(TemplateView):
         )
 
 
-# TODO replace this with ErrorView and a template in `errors/` instead
-class TeapotView(TemplateView):
-    template_name = "core/teapot.html"
+class PageNotFoundView(View):
+
+    """Just a 404 view that ignores all URL parameters."""
 
     def get(self, request, *args, **kwargs):
-        context = self.get_context_data(**kwargs)
-        return self.render_to_response(context, status=418)
+        raise Http404()
 
 
 def do_not_track(request):

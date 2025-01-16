@@ -4,6 +4,7 @@
 from unittest import mock
 
 import django_dynamic_fixture as fixture
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.test import TestCase
 from django.test.utils import override_settings
@@ -49,10 +50,12 @@ class NotificationTests(TestCase):
                 "foo": build,
                 "production_uri": "https://readthedocs.org",
                 # readthedocs_processor context
+                "ADMIN_URL": mock.ANY,
                 "DASHBOARD_ANALYTICS_CODE": mock.ANY,
                 "DO_NOT_TRACK_ENABLED": mock.ANY,
                 "GLOBAL_ANALYTICS_CODE": mock.ANY,
                 "PRODUCTION_DOMAIN": "readthedocs.org",
+                "SWITCH_PRODUCTION_DOMAIN": settings.SWITCH_PRODUCTION_DOMAIN,
                 "PUBLIC_DOMAIN": mock.ANY,
                 "PUBLIC_API_URL": mock.ANY,
                 "RTD_EXT_THEME_ENABLED": mock.ANY,

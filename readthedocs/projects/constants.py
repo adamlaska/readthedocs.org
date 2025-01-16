@@ -34,6 +34,7 @@ MEDIA_TYPE_PDF = "pdf"
 MEDIA_TYPE_EPUB = "epub"
 MEDIA_TYPE_HTMLZIP = "htmlzip"
 MEDIA_TYPE_JSON = "json"
+MEDIA_TYPE_DIFF = "diff"
 DOWNLOADABLE_MEDIA_TYPES = (
     MEDIA_TYPE_PDF,
     MEDIA_TYPE_EPUB,
@@ -45,6 +46,7 @@ MEDIA_TYPES = (
     MEDIA_TYPE_EPUB,
     MEDIA_TYPE_HTMLZIP,
     MEDIA_TYPE_JSON,
+    MEDIA_TYPE_DIFF,
 )
 
 BUILD_COMMANDS_OUTPUT_PATH = "_readthedocs/"
@@ -81,16 +83,9 @@ STATUS_CHOICES = (
 )
 
 REPO_TYPE_GIT = "git"
-REPO_TYPE_SVN = "svn"
-REPO_TYPE_HG = "hg"
-REPO_TYPE_BZR = "bzr"
 
-REPO_CHOICES = (
-    (REPO_TYPE_GIT, _("Git")),
-    (REPO_TYPE_SVN, _("Subversion")),
-    (REPO_TYPE_HG, _("Mercurial")),
-    (REPO_TYPE_BZR, _("Bazaar")),
-)
+# TODO: Remove this since we only have 1 type.
+REPO_CHOICES = ((REPO_TYPE_GIT, _("Git")),)
 
 PUBLIC = "public"
 PRIVATE = "private"
@@ -276,7 +271,15 @@ LANGUAGES = (
     ("yi", "Yiddish"),
     ("yo", "Yoruba"),
     ("za", "Zhuang"),
-    ("zh", "Chinese"),
+    # TODO: migrate those projects that are currently using "zh" as language.
+    # This is an invalid language code, so the first step is remove it from the
+    # list of possible languages.
+    # https://github.com/readthedocs/readthedocs.org/issues/11387
+    #
+    # In [1]: Project.objects.filter(language='zh').count()
+    # Out[1]: 1485
+    #
+    # ("zh", "Chinese"),
     ("zu", "Zulu"),
     # Try these to test our non-2 letter language support
     ("nb-no", "Norwegian Bokmal"),
@@ -309,6 +312,11 @@ LANGUAGES_REGEX = "|".join(
         re.escape(code)
         for code in LANGUAGE_CODES + list(OLD_LANGUAGES_CODE_MAPPING.values())
     ]
+    # Add "zh" here to be able to keep serving projects with this old invalid language code.
+    # We don't allow new projects to select this language code anymore.
+    #
+    # https://github.com/readthedocs/readthedocs.org/issues/11428
+    + ["zh"]
 )
 
 PROGRAMMING_LANGUAGES = (
@@ -363,23 +371,12 @@ GITLAB_REGEXS = [
     re.compile(r"gitlab.com/(.+)/(.+)"),
     re.compile(r"gitlab.com:(.+)/(.+)\.git$"),
 ]
-GITHUB_URL = (
-    "https://github.com/{user}/{repo}/"
-    "{action}/{version}{docroot}{path}{source_suffix}"
-)
 GITHUB_COMMIT_URL = "https://github.com/{user}/{repo}/commit/{commit}"
 GITHUB_PULL_REQUEST_URL = "https://github.com/{user}/{repo}/pull/{number}"
 GITHUB_PULL_REQUEST_COMMIT_URL = (
     "https://github.com/{user}/{repo}/pull/{number}/commits/{commit}"
 )
-BITBUCKET_URL = (
-    "https://bitbucket.org/{user}/{repo}/src/{version}{docroot}{path}{source_suffix}"
-)
 BITBUCKET_COMMIT_URL = "https://bitbucket.org/{user}/{repo}/commits/{commit}"
-GITLAB_URL = (
-    "https://gitlab.com/{user}/{repo}/"
-    "{action}/{version}{docroot}{path}{source_suffix}"
-)
 GITLAB_COMMIT_URL = "https://gitlab.com/{user}/{repo}/commit/{commit}"
 GITLAB_MERGE_REQUEST_COMMIT_URL = (
     "https://gitlab.com/{user}/{repo}/commit/{commit}?merge_request_iid={number}"
@@ -445,4 +442,16 @@ ADDONS_FLYOUT_SORTING_CHOICES = (
     ),
     (ADDONS_FLYOUT_SORTING_CALVER, _("CalVer (YYYY.0M.0M)")),
     (ADDONS_FLYOUT_SORTING_CUSTOM_PATTERN, _("Define your own pattern")),
+)
+
+ADDONS_FLYOUT_POSITION_BOTTOM_LEFT = "bottom-left"
+ADDONS_FLYOUT_POSITION_BOTTOM_RIGHT = "bottom-right"
+ADDONS_FLYOUT_POSITION_TOP_LEFT = "top-left"
+ADDONS_FLYOUT_POSITION_TOP_RIGHT = "top-right"
+ADDONS_FLYOUT_POSITION_CHOICES = (
+    (None, _("Default (from theme or Read the Docs)")),
+    (ADDONS_FLYOUT_POSITION_BOTTOM_LEFT, _("Bottom left")),
+    (ADDONS_FLYOUT_POSITION_BOTTOM_RIGHT, _("Bottom right")),
+    (ADDONS_FLYOUT_POSITION_TOP_LEFT, _("Top left")),
+    (ADDONS_FLYOUT_POSITION_TOP_RIGHT, _("Top right")),
 )

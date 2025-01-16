@@ -169,6 +169,7 @@ class HttpExchange(models.Model):
 
     class Meta:
         ordering = ["-date"]
+        indexes = [models.Index(fields=["content_type", "object_id", "date"])]
 
     def __str__(self):
         return _("Exchange {0}").format(self.pk)
@@ -309,9 +310,7 @@ class Integration(TimeStampedModel):
     has_sync = False
 
     def __str__(self):
-        return _("{0} for {1}").format(
-            self.get_integration_type_display(), self.project.name
-        )
+        return self.get_integration_type_display()
 
     def save(self, *args, **kwargs):
         if not self.secret:

@@ -47,7 +47,7 @@ class DockerBaseSettings(CommunityBaseSettings):
         HOSTIP = ips[0][:-1] + "1"
 
     # Turn this on to test ads
-    USE_PROMOS = False
+    USE_PROMOS = os.environ.get("RTD_USE_PROMOS") is not None
     ADSERVER_API_BASE = f"http://{HOSTIP}:5000"
     # Create a Token for an admin User and set it here.
     ADSERVER_API_KEY = None
@@ -196,6 +196,7 @@ class DockerBaseSettings(CommunityBaseSettings):
     S3_STATIC_STORAGE_BUCKET = "static"
     S3_STATIC_STORAGE_OVERRIDE_HOSTNAME = PRODUCTION_DOMAIN
     S3_MEDIA_STORAGE_OVERRIDE_HOSTNAME = PRODUCTION_DOMAIN
+    S3_PROVIDER = "minio"
 
     AWS_S3_ENCRYPTION = False
     AWS_S3_SECURE_URLS = False

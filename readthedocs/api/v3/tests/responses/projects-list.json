@@ -29,6 +29,7 @@
             "urls": {
                 "builds": "https://readthedocs.org/projects/project/builds/",
                 "documentation": "http://project.readthedocs.io/en/latest/",
+                "downloads": "https://readthedocs.org/projects/project/downloads/",
                 "home": "https://readthedocs.org/projects/project/",
                 "versions": "https://readthedocs.org/projects/project/versions/"
             },
@@ -51,6 +52,7 @@
                 "redirects": "https://readthedocs.org/api/v3/projects/project/redirects/",
                 "subprojects": "https://readthedocs.org/api/v3/projects/project/subprojects/",
                 "superproject": "https://readthedocs.org/api/v3/projects/project/superproject/",
+       "sync_versions": "https://readthedocs.org/api/v3/projects/project/sync-versions/",
                 "translations": "https://readthedocs.org/api/v3/projects/project/translations/"
             },
             "privacy_level": "public",

@@ -13,6 +13,7 @@ from readthedocs.builds.constants import (
     EXTERNAL,
 )
 from readthedocs.core.permissions import AdminPermission
+from readthedocs.core.querysets import NoReprQuerySet
 from readthedocs.core.utils.extend import SettingsOverrideObject
 from readthedocs.projects import constants
 from readthedocs.projects.models import Project
@@ -23,7 +24,7 @@ log = structlog.get_logger(__name__)
 __all__ = ["VersionQuerySet", "BuildQuerySet", "RelatedBuildQuerySet"]
 
 
-class VersionQuerySetBase(models.QuerySet):
+class VersionQuerySetBase(NoReprQuerySet, models.QuerySet):
 
     """Versions take into account their own privacy_level setting."""
 
@@ -118,6 +119,11 @@ class VersionQuerySetBase(models.QuerySet):
     def api(self, user=None):
         return self.public(user, only_active=False)
 
+    def api_v2(self, *args, **kwargs):
+        # API v2 is the same as API v3 for .org, but it's
+        # different for .com, this method is overridden there.
+        return self.api(*args, **kwargs)
+
     def for_reindex(self):
         """
         Get all versions that can be reindexed.
@@ -145,7 +151,7 @@ class VersionQuerySet(SettingsOverrideObject):
     _default_class = VersionQuerySetBase
 
 
-class BuildQuerySet(models.QuerySet):
+class BuildQuerySet(NoReprQuerySet, models.QuerySet):
 
     """
     Build objects that are privacy aware.
@@ -203,6 +209,11 @@ class BuildQuerySet(models.QuerySet):
 
     def api(self, user=None):
         return self.public(user)
+
+    def api_v2(self, *args, **kwargs):
+        # API v2 is the same as API v3 for .org, but it's
+        # different for .com, this method is overridden there.
+        return self.api(*args, **kwargs)
 
     def concurrent(self, project):
         """
@@ -269,7 +280,7 @@ class BuildQuerySet(models.QuerySet):
         return (limit_reached, concurrent, max_concurrent)
 
 
-class RelatedBuildQuerySet(models.QuerySet):
+class RelatedBuildQuerySet(NoReprQuerySet, models.QuerySet):
 
     """
     For models with association to a project through :py:class:`Build`.
@@ -304,3 +315,8 @@ class RelatedBuildQuerySet(models.QuerySet):
 
     def api(self, user=None):
         return self.public(user)
+
+    def api_v2(self, *args, **kwargs):
+        # API v2 is the same as API v3 for .org, but it's
+        # different for .com, this method is overridden there.
+        return self.api(*args, **kwargs)

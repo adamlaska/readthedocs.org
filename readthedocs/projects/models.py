@@ -13,7 +13,6 @@ from django.contrib.auth.models import User
 from django.contrib.contenttypes.fields import GenericRelation
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
-from django.db.models import Prefetch
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.crypto import get_random_string
@@ -36,6 +35,7 @@ from readthedocs.core.resolver import Resolver
 from readthedocs.core.utils import extract_valid_attributes_for_model, slugify
 from readthedocs.core.utils.url import unsafe_join_url_path
 from readthedocs.domains.querysets import DomainQueryset
+from readthedocs.domains.validators import check_domains_limit
 from readthedocs.notifications.models import Notification as NewNotification
 from readthedocs.projects import constants
 from readthedocs.projects.exceptions import ProjectConfigurationError
@@ -46,12 +46,12 @@ from readthedocs.projects.querysets import (
     ProjectQuerySet,
     RelatedProjectQuerySet,
 )
-from readthedocs.projects.templatetags.projects_tags import sort_version_aware
 from readthedocs.projects.validators import (
     validate_build_config_file,
     validate_custom_prefix,
     validate_custom_subproject_prefix,
     validate_domain_name,
+    validate_environment_variable_size,
     validate_no_ip,
     validate_repository_url,
 )
@@ -61,8 +61,9 @@ from readthedocs.storage import build_media_storage
 from readthedocs.vcs_support.backends import backend_cls
 
 from .constants import (
-    ADDONS_FLYOUT_SORTING_ALPHABETICALLY,
+    ADDONS_FLYOUT_POSITION_CHOICES,
     ADDONS_FLYOUT_SORTING_CHOICES,
+    ADDONS_FLYOUT_SORTING_SEMVER_READTHEDOCS_COMPATIBLE,
     DOWNLOADABLE_MEDIA_TYPES,
     MEDIA_TYPES,
     MULTIPLE_VERSIONS_WITH_TRANSLATIONS,
@@ -111,9 +112,6 @@ class ProjectRelationship(models.Model):
 
     objects = ChildRelatedProjectQuerySet.as_manager()
 
-    def __str__(self):
-        return "{} -> {}".format(self.parent, self.child)
-
     def save(self, *args, **kwargs):
         if not self.alias:
             self.alias = self.child.slug
@@ -145,8 +143,6 @@ class AddonsConfig(TimeStampedModel):
     Everything is enabled by default.
     """
 
-    DOC_DIFF_DEFAULT_ROOT_SELECTOR = "[role=main]"
-
     # Model history
     history = ExtraHistoricalRecords()
 
@@ -163,6 +159,24 @@ class AddonsConfig(TimeStampedModel):
         help_text="Enable/Disable all the addons on this project",
     )
 
+    options_root_selector = models.CharField(
+        null=True,
+        blank=True,
+        max_length=128,
+        help_text="CSS selector for the main content of the page. Leave it blank for auto-detect.",
+    )
+
+    # Whether or not load addons library when the requested page is embedded (e.g. inside an iframe)
+    # https://github.com/readthedocs/addons/pull/415
+    options_load_when_embedded = models.BooleanField(default=False)
+
+    options_base_version = models.ForeignKey(
+        "builds.Version",
+        verbose_name=_("Base version to compare against (eg. DocDiff, File Tree Diff)"),
+        null=True,
+        on_delete=models.SET_NULL,
+    )
+
     # Analytics
 
     # NOTE: we keep analytics disabled by default to save resources.
@@ -173,24 +187,22 @@ class AddonsConfig(TimeStampedModel):
     doc_diff_enabled = models.BooleanField(default=True)
     doc_diff_show_additions = models.BooleanField(default=True)
     doc_diff_show_deletions = models.BooleanField(default=True)
-    doc_diff_root_selector = models.CharField(
-        null=True,
-        blank=True,
-        max_length=128,
-        help_text="CSS selector for the main content of the page",
-    )
-
-    # External version warning
-    external_version_warning_enabled = models.BooleanField(default=True)
 
     # EthicalAds
     ethicalads_enabled = models.BooleanField(default=True)
 
+    # File Tree Diff
+    filetreediff_enabled = models.BooleanField(default=False, null=True, blank=True)
+
     # Flyout
-    flyout_enabled = models.BooleanField(default=True)
+    flyout_enabled = models.BooleanField(
+        default=True,
+        verbose_name=_("Enabled"),
+    )
     flyout_sorting = models.CharField(
+        verbose_name=_("Sorting of versions"),
         choices=ADDONS_FLYOUT_SORTING_CHOICES,
-        default=ADDONS_FLYOUT_SORTING_ALPHABETICALLY,
+        default=ADDONS_FLYOUT_SORTING_SEMVER_READTHEDOCS_COMPATIBLE,
         max_length=64,
     )
     flyout_sorting_custom_pattern = models.CharField(
@@ -198,12 +210,24 @@ class AddonsConfig(TimeStampedModel):
         default=None,
         null=True,
         blank=True,
+        verbose_name=_("Custom version sorting pattern"),
         help_text="Sorting pattern supported by BumpVer "
         '(<a href="https://github.com/mbarkhau/bumpver#pattern-examples">See examples</a>)',
     )
     flyout_sorting_latest_stable_at_beginning = models.BooleanField(
+        verbose_name=_(
+            "Show <code>latest</code> and <code>stable</code> at the beginning"
+        ),
         default=True,
-        help_text="Show <code>latest</code> and <code>stable</code> at the beginning",
+    )
+
+    flyout_position = models.CharField(
+        choices=ADDONS_FLYOUT_POSITION_CHOICES,
+        max_length=64,
+        default=None,  # ``None`` means use the default (theme override if present or Read the Docs default)
+        null=True,
+        blank=True,
+        verbose_name=_("Position"),
     )
 
     # Hotkeys
@@ -213,8 +237,26 @@ class AddonsConfig(TimeStampedModel):
     search_enabled = models.BooleanField(default=True)
     search_default_filter = models.CharField(null=True, blank=True, max_length=128)
 
-    # Stable/Latest version warning
-    stable_latest_version_warning_enabled = models.BooleanField(default=True)
+    # User JavaScript File
+    customscript_enabled = models.BooleanField(default=False)
+
+    # This is a user-defined file that will be injected at serve time by our
+    # Cloudflare Worker if defined
+    customscript_src = models.CharField(
+        max_length=512,
+        null=True,
+        blank=True,
+        help_text="URL to a JavaScript file to inject at serve time",
+    )
+
+    # Notifications
+    notifications_enabled = models.BooleanField(default=True)
+    notifications_show_on_latest = models.BooleanField(default=True)
+    notifications_show_on_non_stable = models.BooleanField(default=True)
+    notifications_show_on_external = models.BooleanField(default=True)
+
+    # Link Previews
+    linkpreviews_enabled = models.BooleanField(default=False)
 
 
 class AddonSearchFilter(TimeStampedModel):
@@ -260,7 +302,7 @@ class Project(models.Model):
         _("Repository URL"),
         max_length=255,
         validators=[validate_repository_url],
-        help_text=_("Hosted documentation repository URL"),
+        help_text=_("Git repository URL"),
         db_index=True,
     )
 
@@ -283,16 +325,17 @@ class Project(models.Model):
         help_text=_("URL that documentation is expected to serve from"),
     )
     versioning_scheme = models.CharField(
-        _("Versioning scheme"),
+        _("URL versioning scheme"),
         max_length=120,
         default=constants.MULTIPLE_VERSIONS_WITH_TRANSLATIONS,
         choices=constants.VERSIONING_SCHEME_CHOICES,
         # TODO: remove after migration
         null=True,
         help_text=_(
-            "This affects how the URL of your documentation looks like, "
-            "and if it supports translations or multiple versions. "
-            "Changing the versioning scheme will break your current URLs."
+            "This affects URL your documentation is served from, "
+            "and if it supports translations or versions. "
+            "Changing the versioning scheme will break your current URLs, "
+            "so you might need to create a redirect."
         ),
     )
     # TODO: this field is deprecated, use `versioning_scheme` instead.
@@ -542,6 +585,8 @@ class Project(models.Model):
 
     remote_repository = models.ForeignKey(
         "oauth.RemoteRepository",
+        verbose_name=_("Connected repository"),
+        help_text=_("Repository connected to this project"),
         on_delete=models.SET_NULL,
         related_name="projects",
         null=True,
@@ -635,13 +680,21 @@ class Project(models.Model):
     def get_absolute_url(self):
         return reverse("projects_detail", args=[self.slug])
 
-    def get_docs_url(self, version_slug=None, lang_slug=None, external=False):
+    def get_docs_url(
+        self,
+        version_slug=None,
+        lang_slug=None,
+        external=False,
+        resolver=None,
+    ):
         """
         Return a URL for the docs.
 
-        ``external`` defaults False because we only link external versions in very specific places
+        ``external`` defaults False because we only link external versions in very specific places.
+        ``resolver`` is used to "share a resolver" between the same request.
         """
-        return Resolver().resolve(
+        resolver = resolver or Resolver()
+        return resolver.resolve(
             project=self,
             version_slug=version_slug,
             language=lang_slug,
@@ -1037,43 +1090,6 @@ class Project(models.Model):
             active=True, uploaded=True
         )
 
-    def ordered_active_versions(self, **kwargs):
-        """
-        Get all active versions, sorted.
-
-        :param kwargs: All kwargs are passed down to the
-                       `Version.internal.public` queryset.
-        """
-        from readthedocs.builds.models import Version
-
-        kwargs.update(
-            {
-                "project": self,
-                "only_active": True,
-                "only_built": True,
-            },
-        )
-        versions = (
-            Version.internal.public(**kwargs)
-            .select_related(
-                "project",
-                "project__main_language_project",
-            )
-            .prefetch_related(
-                Prefetch(
-                    "project__superprojects",
-                    ProjectRelationship.objects.all().select_related("parent"),
-                    to_attr="_superprojects",
-                ),
-                Prefetch(
-                    "project__domains",
-                    Domain.objects.filter(canonical=True),
-                    to_attr="_canonical_domains",
-                ),
-            )
-        )
-        return sort_version_aware(versions)
-
     def all_active_versions(self):
         """
         Get queryset with all active versions.
@@ -1237,7 +1253,10 @@ class Project(models.Model):
         if self.remote_repository and self.remote_repository.default_branch:
             return self.remote_repository.default_branch
 
-        return self.vcs_class().fallback_branch
+        vcs_class = self.vcs_class()
+        if vcs_class:
+            return vcs_class.fallback_branch
+        return "Unknown"
 
     def add_subproject(self, child, alias=None):
         subproject, _ = ProjectRelationship.objects.get_or_create(
@@ -1498,9 +1517,6 @@ class ImportedFile(models.Model):
             filename=self.path,
         )
 
-    def __str__(self):
-        return "{}: {}".format(self.name, self.project)
-
 
 class HTMLFile(ImportedFile):
 
@@ -1688,9 +1704,6 @@ class WebHook(Notification):
         )
         return digest.hexdigest()
 
-    def __str__(self):
-        return f"{self.project.slug} {self.url}"
-
 
 class Domain(TimeStampedModel):
 
@@ -1782,10 +1795,7 @@ class Domain(TimeStampedModel):
         ordering = ("-canonical", "-machine", "domain")
 
     def __str__(self):
-        return "{domain} pointed at {project}".format(
-            domain=self.domain,
-            project=self.project.name,
-        )
+        return self.domain
 
     @property
     def is_valid(self):
@@ -1806,6 +1816,9 @@ class Domain(TimeStampedModel):
         if not self.is_valid and self.validation_process_expired:
             self.validation_process_start = timezone.now()
             self.save()
+
+    def clean(self):
+        check_domains_limit(self.project)
 
     def save(self, *args, **kwargs):
         parsed = urlparse(self.domain)
@@ -1856,7 +1869,7 @@ class HTTPHeader(TimeStampedModel, models.Model):
     )
 
     def __str__(self):
-        return f"HttpHeader: {self.name} on {self.domain.domain}"
+        return self.name
 
 
 class Feature(models.Model):
@@ -1877,10 +1890,7 @@ class Feature(models.Model):
 
     # Feature constants - this is not a exhaustive list of features, features
     # may be added by other packages
-    MKDOCS_THEME_RTD = "mkdocs_theme_rtd"
     API_LARGE_DATA = "api_large_data"
-    CONDA_APPEND_CORE_REQUIREMENTS = "conda_append_core_requirements"
-    ALL_VERSIONS_IN_HTML_CONTEXT = "all_versions_in_html_context"
     RECORD_404_PAGE_VIEWS = "record_404_page_views"
     DISABLE_PAGEVIEWS = "disable_pageviews"
     RESOLVE_PROJECT_FROM_HEADER = "resolve_project_from_header"
@@ -1900,7 +1910,6 @@ class Feature(models.Model):
     INSTALL_LATEST_CORE_REQUIREMENTS = "install_latest_core_requirements"
 
     # Search related features
-    DISABLE_SERVER_SIDE_SEARCH = "disable_server_side_search"
     ENABLE_MKDOCS_SERVER_SIDE_SEARCH = "enable_mkdocs_server_side_search"
     DEFAULT_TO_FUZZY_SEARCH = "default_to_fuzzy_search"
 
@@ -1909,23 +1918,8 @@ class Feature(models.Model):
 
     FEATURES = (
         (
-            MKDOCS_THEME_RTD,
-            _("MkDocs: Use Read the Docs theme for MkDocs as default theme"),
-        ),
-        (
             API_LARGE_DATA,
             _("Build: Try alternative method of posting large data"),
-        ),
-        (
-            CONDA_APPEND_CORE_REQUIREMENTS,
-            _("Conda: Append Read the Docs core requirements to environment.yml file"),
-        ),
-        (
-            ALL_VERSIONS_IN_HTML_CONTEXT,
-            _(
-                "Sphinx: Pass all versions (including private) into the html context "
-                "when building with Sphinx"
-            ),
         ),
         (
             RECORD_404_PAGE_VIEWS,
@@ -1981,10 +1975,6 @@ class Feature(models.Model):
         ),
         # Search related features.
         (
-            DISABLE_SERVER_SIDE_SEARCH,
-            _("Search: Disable server side search"),
-        ),
-        (
             ENABLE_MKDOCS_SERVER_SIDE_SEARCH,
             _("Search: Enable server side search for MkDocs projects"),
         ),
@@ -2030,9 +2020,7 @@ class Feature(models.Model):
     objects = FeatureQuerySet.as_manager()
 
     def __str__(self):
-        return "{} feature".format(
-            self.get_feature_display(),
-        )
+        return self.get_feature_display()
 
     def get_feature_display(self):
         """
@@ -2041,7 +2029,7 @@ class Feature(models.Model):
         Because the field is not a ChoiceField here, we need to manually
         implement this behavior.
         """
-        return dict(self.FEATURES).get(self.feature_id, self.feature_id)
+        return str(dict(self.FEATURES).get(self.feature_id, self.feature_id))
 
 
 class EnvironmentVariable(TimeStampedModel, models.Model):
@@ -2050,7 +2038,7 @@ class EnvironmentVariable(TimeStampedModel, models.Model):
         help_text=_("Name of the environment variable"),
     )
     value = models.CharField(
-        max_length=2048,
+        max_length=48000,
         help_text=_("Value of the environment variable"),
     )
     project = models.ForeignKey(
@@ -2073,3 +2061,9 @@ class EnvironmentVariable(TimeStampedModel, models.Model):
     def save(self, *args, **kwargs):
         self.value = quote(self.value)
         return super().save(*args, **kwargs)
+
+    def clean(self):
+        validate_environment_variable_size(
+            project=self.project, new_env_value=self.value
+        )
+        return super().clean()

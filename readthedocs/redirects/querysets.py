@@ -6,6 +6,7 @@ from django.db import models
 from django.db.models import CharField, F, Q, Value
 
 from readthedocs.core.permissions import AdminPermission
+from readthedocs.core.querysets import NoReprQuerySet
 from readthedocs.redirects.constants import (
     CLEAN_URL_TO_HTML_REDIRECT,
     EXACT_REDIRECT,
@@ -16,7 +17,7 @@ from readthedocs.redirects.constants import (
 log = structlog.get_logger(__name__)
 
 
-class RedirectQuerySet(models.QuerySet):
+class RedirectQuerySet(NoReprQuerySet, models.QuerySet):
 
     """Redirects take into account their own privacy_level setting."""
 
@@ -38,6 +39,11 @@ class RedirectQuerySet(models.QuerySet):
         if user:
             queryset = self._add_from_user_projects(queryset, user)
         return queryset
+
+    def api_v2(self, *args, **kwargs):
+        # API v2 is the same as API v3 for .org, but it's
+        # different for .com, this method is overridden there.
+        return self.api(*args, **kwargs)
 
     def get_matching_redirect_with_path(
         self, filename, path=None, language=None, version_slug=None, forced_only=False

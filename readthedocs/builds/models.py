@@ -11,7 +11,6 @@ from django.contrib.contenttypes.fields import GenericRelation
 from django.db import models
 from django.urls import reverse
 from django.utils import timezone
-from django.utils.translation import gettext
 from django.utils.translation import gettext_lazy as _
 from django_extensions.db.models import TimeStampedModel
 from polymorphic.models import PolymorphicModel
@@ -29,11 +28,9 @@ from readthedocs.builds.constants import (
     EXTERNAL_VERSION_STATES,
     INTERNAL,
     LATEST,
-    NON_REPOSITORY_VERSIONS,
     PREDEFINED_MATCH_ARGS,
     PREDEFINED_MATCH_ARGS_VALUES,
     STABLE,
-    TAG,
     VERSION_TYPES,
 )
 from readthedocs.builds.managers import (
@@ -62,14 +59,11 @@ from readthedocs.core.utils import extract_valid_attributes_for_model, trigger_b
 from readthedocs.notifications.models import Notification
 from readthedocs.projects.constants import (
     BITBUCKET_COMMIT_URL,
-    BITBUCKET_URL,
     DOCTYPE_CHOICES,
     GITHUB_COMMIT_URL,
     GITHUB_PULL_REQUEST_COMMIT_URL,
-    GITHUB_URL,
     GITLAB_COMMIT_URL,
     GITLAB_MERGE_REQUEST_COMMIT_URL,
-    GITLAB_URL,
     MEDIA_TYPES,
     MKDOCS,
     MKDOCS_HTML,
@@ -106,8 +100,7 @@ class Version(TimeStampedModel):
     # used by the vcs backend
 
     #: The identifier is the ID for the revision this is version is for.
-    #: This might be the revision number (e.g. in SVN),
-    #: or the commit hash (e.g. in Git).
+    #: This is the commit hash (e.g. in Git).
     #: If the this version is pointing to a branch,
     #: then ``identifier`` will contain the branch name.
     #: `None`/`null` means it will use the VCS default branch.
@@ -210,13 +203,7 @@ class Version(TimeStampedModel):
         ordering = ["-verbose_name"]
 
     def __str__(self):
-        return gettext(
-            "Version {version} of {project} ({pk})".format(
-                version=self.verbose_name,
-                project=self.project,
-                pk=self.pk,
-            ),
-        )
+        return self.verbose_name
 
     @property
     def is_private(self):
@@ -271,7 +258,12 @@ class Version(TimeStampedModel):
 
     @property
     def ref(self):
-        if self.slug == STABLE:
+        """
+        The version slug where the ``stable`` version points to.
+
+        It returns None when the version is not stable (machine created).
+        """
+        if self.slug == STABLE and self.machine:
             stable = determine_stable_version(
                 self.project.versions(manager=INTERNAL).all()
             )
@@ -281,15 +273,12 @@ class Version(TimeStampedModel):
     @property
     def vcs_url(self):
         version_name = self.verbose_name
-        if not self.is_external:
-            if self.slug == STABLE:
-                version_name = self.ref
-            elif self.slug == LATEST:
-                version_name = self.project.get_default_branch()
-            else:
-                version_name = self.slug
-            if "bitbucket" in self.project.repo:
-                version_name = self.identifier
+        if self.slug == STABLE and self.machine:
+            stable_version = self.project.get_original_stable_version()
+            if stable_version:
+                version_name = stable_version.verbose_name
+        elif self.slug == LATEST and self.machine:
+            version_name = self.project.get_default_branch()
 
         return get_vcs_url(
             project=self.project,
@@ -299,7 +288,24 @@ class Version(TimeStampedModel):
 
     @property
     def last_build(self):
+        # TODO deprecated in favor of `latest_build`, which matches naming on
+        # the Project model
+        return self.latest_build
+
+    @property
+    def latest_build(self):
         return self.builds.order_by("-date").first()
+
+    @property
+    def latest_successful_build(self):
+        return (
+            self.builds.filter(
+                state=BUILD_STATE_FINISHED,
+                success=True,
+            )
+            .order_by("-date")
+            .first()
+        )
 
     @property
     def config(self):
@@ -323,55 +329,32 @@ class Version(TimeStampedModel):
         return None
 
     @property
-    def commit_name(self):
+    def git_identifier(self):
         """
-        Return the branch name, the tag name or the revision identifier.
+        Return the branch or tag name of the version.
 
         The result could be used as ref in a git repo, e.g. for linking to
         GitHub, Bitbucket or GitLab.
+
+        - If the version is latest (machine created), we resolve to the default branch of the project.
+        - If the version is stable (machine created), we resolve to the branch that the stable version points to.
+        - If the version is external, we return the PR identifier, since we don't have access to the name of the branch.
         """
-        # LATEST is special as it is usually a branch but does not contain the
-        # name in verbose_name.
-        if self.slug == LATEST:
+        # Latest is special as it doesn't contain the actual name in verbose_name.
+        if self.slug == LATEST and self.machine:
             return self.project.get_default_branch()
 
-        if self.slug == STABLE:
-            if self.type == BRANCH:
-                # Special case, as we do not store the original branch name
-                # that the stable version works on. We can only interpolate the
-                # name from the commit identifier, but it's hacky.
-                # TODO: Refactor ``Version`` to store more actual info about
-                # the underlying commits.
-                if self.identifier.startswith("origin/"):
-                    return self.identifier[len("origin/") :]
-            return self.identifier
+        # Stable is special as it doesn't contain the actual name in verbose_name.
+        if self.slug == STABLE and self.machine:
+            original_stable = self.project.get_original_stable_version()
+            # NOTE: we no longer save branch names with the "origin/" prefix,
+            # but we remove it for old versions.
+            if original_stable:
+                return original_stable.verbose_name.removeprefix("origin/")
+            return self.identifier.removeprefix("origin/")
 
-        # By now we must have handled all special versions.
-        if self.slug in NON_REPOSITORY_VERSIONS:
-            # pylint: disable=broad-exception-raised
-            raise Exception("All special versions must be handled by now.")
-
-        if self.type in (BRANCH, TAG):
-            # If this version is a branch or a tag, the verbose_name will
-            # contain the actual name. We cannot use identifier as this might
-            # include the "origin/..." part in the case of a branch. A tag
-            # would contain the hash in identifier, which is not as pretty as
-            # the actual tag name.
-            return self.verbose_name
-
-        if self.type == EXTERNAL:
-            # If this version is a EXTERNAL version, the identifier will
-            # contain the actual commit hash. which we can use to
-            # generate url for a given file name
-            return self.identifier
-
-        # If we came that far it's not a special version
-        # nor a branch, tag or EXTERNAL version.
-        # Therefore just return the identifier to make a safe guess.
-        log.debug(
-            "TODO: Raise an exception here. Testing what cases it happens",
-        )
-        return self.identifier
+        # For all other cases, verbose_name contains the actual name of the branch/tag.
+        return self.verbose_name
 
     def get_absolute_url(self):
         """
@@ -541,121 +524,6 @@ class Version(TimeStampedModel):
 
         return paths
 
-    def get_github_url(
-        self,
-        docroot,
-        filename,
-        source_suffix=".rst",
-        action="view",
-    ):
-        """
-        Return a GitHub URL for a given filename.
-
-        :param docroot: Location of documentation in repository
-        :param filename: Name of file
-        :param source_suffix: File suffix of documentation format
-        :param action: `view` (default) or `edit`
-        """
-        repo_url = self.project.repo
-        if "github" not in repo_url:
-            return ""
-
-        if not docroot:
-            return ""
-
-        # Normalize /docroot/
-        docroot = "/" + docroot.strip("/") + "/"
-
-        if action == "view":
-            action_string = "blob"
-        elif action == "edit":
-            action_string = "edit"
-
-        user, repo = get_github_username_repo(repo_url)
-        if not user and not repo:
-            return ""
-
-        if not filename:
-            # If there isn't a filename, we don't need a suffix
-            source_suffix = ""
-
-        return GITHUB_URL.format(
-            user=user,
-            repo=repo,
-            version=self.commit_name,
-            docroot=docroot,
-            path=filename,
-            source_suffix=source_suffix,
-            action=action_string,
-        )
-
-    def get_gitlab_url(
-        self,
-        docroot,
-        filename,
-        source_suffix=".rst",
-        action="view",
-    ):
-        repo_url = self.project.repo
-        if "gitlab" not in repo_url:
-            return ""
-
-        if not docroot:
-            return ""
-
-        # Normalize /docroot/
-        docroot = "/" + docroot.strip("/") + "/"
-
-        if action == "view":
-            action_string = "blob"
-        elif action == "edit":
-            action_string = "edit"
-
-        user, repo = get_gitlab_username_repo(repo_url)
-        if not user and not repo:
-            return ""
-
-        if not filename:
-            # If there isn't a filename, we don't need a suffix
-            source_suffix = ""
-
-        return GITLAB_URL.format(
-            user=user,
-            repo=repo,
-            version=self.commit_name,
-            docroot=docroot,
-            path=filename,
-            source_suffix=source_suffix,
-            action=action_string,
-        )
-
-    def get_bitbucket_url(self, docroot, filename, source_suffix=".rst"):
-        repo_url = self.project.repo
-        if "bitbucket" not in repo_url:
-            return ""
-        if not docroot:
-            return ""
-
-        # Normalize /docroot/
-        docroot = "/" + docroot.strip("/") + "/"
-
-        user, repo = get_bitbucket_username_repo(repo_url)
-        if not user and not repo:
-            return ""
-
-        if not filename:
-            # If there isn't a filename, we don't need a suffix
-            source_suffix = ""
-
-        return BITBUCKET_URL.format(
-            user=user,
-            repo=repo,
-            version=self.commit_name,
-            docroot=docroot,
-            path=filename,
-            source_suffix=source_suffix,
-        )
-
 
 class APIVersion(Version):
 
@@ -674,6 +542,10 @@ class APIVersion(Version):
     """
 
     project = None
+    # This is a property in the original model, in order to
+    # be able to assign it a value in the constructor, we need to re-declare it
+    # as an attribute here.
+    git_identifier = None
 
     class Meta:
         proxy = True
@@ -681,6 +553,7 @@ class APIVersion(Version):
     def __init__(self, *args, **kwargs):
         self.project = APIProject(**kwargs.pop("project", {}))
         self.canonical_url = kwargs.pop("canonical_url", None)
+        self.git_identifier = kwargs.pop("git_identifier", None)
         # These fields only exist on the API return, not on the model, so we'll
         # remove them to avoid throwing exceptions due to unexpected fields
         for key in ["resource_uri", "absolute_url", "downloads"]:
@@ -854,6 +727,7 @@ class Build(models.Model):
         ]
         indexes = [
             models.Index(fields=["project", "date"]),
+            models.Index(fields=["version", "date"]),
         ]
 
     def __init__(self, *args, **kwargs):
@@ -939,17 +813,6 @@ class Build(models.Model):
 
         super().save(*args, **kwargs)
         self._config_changed = False
-
-    def __str__(self):
-        return gettext(
-            "Build {project} for {usernames} ({pk})".format(
-                project=self.project,
-                usernames=" ".join(
-                    self.project.users.all().values_list("username", flat=True),
-                ),
-                pk=self.pk,
-            ),
-        )
 
     def get_absolute_url(self):
         return reverse("builds_detail", args=[self.project.slug, self.pk])
@@ -1159,11 +1022,6 @@ class BuildCommandResult(BuildCommandResultMixin, models.Model):
 
     objects = RelatedBuildQuerySet.as_manager()
 
-    def __str__(self):
-        return gettext("Build command {pk} for build {build}").format(
-            pk=self.pk, build=self.build
-        )
-
     @property
     def run_time(self):
         """Total command runtime in seconds."""
@@ -1347,11 +1205,7 @@ class VersionAutomationRule(PolymorphicModel, TimeStampedModel):
 
     def __str__(self):
         class_name = self.__class__.__name__
-        return (
-            f"({self.priority}) "
-            f"{class_name}/{self.get_action_display()} "
-            f"for {self.project.slug}:{self.get_version_type_display()}"
-        )
+        return f"({self.priority}) {class_name}/{self.get_action_display()}"
 
 
 class RegexAutomationRule(VersionAutomationRule):

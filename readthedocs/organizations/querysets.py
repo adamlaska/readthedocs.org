@@ -8,11 +8,12 @@ from django.db.models import Count, Q
 from django.utils import timezone
 from djstripe.enums import InvoiceStatus, SubscriptionStatus
 
+from readthedocs.core.querysets import NoReprQuerySet
 from readthedocs.core.utils.extend import SettingsOverrideObject
 from readthedocs.subscriptions.constants import DISABLE_AFTER_DAYS
 
 
-class BaseOrganizationQuerySet(models.QuerySet):
+class BaseOrganizationQuerySet(NoReprQuerySet, models.QuerySet):
 
     """Organizations queryset."""
 
@@ -24,6 +25,9 @@ class BaseOrganizationQuerySet(models.QuerySet):
 
     def for_admin_user(self, user):
         return self.filter(owners__in=[user]).distinct()
+
+    def api(self, user):
+        return self.for_user(user)
 
     def created_days_ago(self, days, field="pub_date"):
         """

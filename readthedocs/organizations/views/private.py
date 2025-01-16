@@ -9,13 +9,13 @@ from django.urls import reverse, reverse_lazy
 from django.utils import timezone
 from django.utils.http import urlencode
 from django.utils.translation import gettext_lazy as _
-from vanilla import CreateView, DeleteView, FormView, ListView, UpdateView
+from vanilla import CreateView, FormView, ListView, UpdateView
 
 from readthedocs.audit.filters import OrganizationSecurityLogFilter
 from readthedocs.audit.models import AuditLog
 from readthedocs.core.filters import FilterContextMixin
 from readthedocs.core.history import UpdateChangeReasonPostView
-from readthedocs.core.mixins import PrivateViewMixin
+from readthedocs.core.mixins import DeleteViewWithMessage, PrivateViewMixin
 from readthedocs.invitations.models import Invitation
 from readthedocs.organizations.filters import OrganizationListFilterSet
 from readthedocs.organizations.forms import (
@@ -72,7 +72,6 @@ class ListOrganization(
     admin_only = False
 
     filterset_class = OrganizationListFilterSet
-    strict = True  # Return an empty queryset on filter validation errors
 
     def get_queryset(self):
         return Organization.objects.for_user(user=self.request.user)
@@ -118,15 +117,17 @@ class EditOrganization(
     UpdateView,
 ):
     template_name = "organizations/admin/organization_edit.html"
+    success_message = _("Organization updated")
 
 
 class DeleteOrganization(
     PrivateViewMixin,
     UpdateChangeReasonPostView,
     OrganizationView,
-    DeleteView,
+    DeleteViewWithMessage,
 ):
     template_name = "organizations/admin/organization_delete.html"
+    success_message = _("Organization deleted")
 
     def get_success_url(self):
         return reverse_lazy("organization_list")
@@ -152,14 +153,15 @@ class AddOrganizationOwner(PrivateViewMixin, OrganizationOwnerView, FormView):
         return super().form_valid(form)
 
 
-class DeleteOrganizationOwner(PrivateViewMixin, OrganizationOwnerView, DeleteView):
+class DeleteOrganizationOwner(
+    PrivateViewMixin, OrganizationOwnerView, DeleteViewWithMessage
+):
     success_message = _("Owner removed")
     http_method_names = ["post"]
 
     def post(self, request, *args, **kwargs):
         if self._is_last_user():
             return HttpResponseBadRequest(_("User is the last owner, can't be removed"))
-        messages.success(self.request, self.success_message)
         return super().post(request, *args, **kwargs)
 
 
@@ -173,16 +175,10 @@ class DeleteOrganizationTeam(
     PrivateViewMixin,
     UpdateChangeReasonPostView,
     OrganizationTeamView,
-    DeleteView,
+    DeleteViewWithMessage,
 ):
     template_name = "organizations/team_delete.html"
     success_message = _("Team deleted")
-
-    def post(self, request, *args, **kwargs):
-        """Hack to show messages on delete."""
-        resp = super().post(request, *args, **kwargs)
-        messages.success(self.request, self.success_message)
-        return resp
 
     def get_success_url(self):
         return reverse_lazy(
@@ -204,6 +200,7 @@ class UpdateOrganizationTeamProject(PrivateViewMixin, OrganizationTeamView, Upda
 
 class AddOrganizationTeamMember(PrivateViewMixin, OrganizationTeamMemberView, FormView):
     template_name = "organizations/team_member_create.html"
+    # No success message here, since it's set in the form.
 
     def form_valid(self, form):
         # Manually calling to save, since this isn't a ModelFormView.
@@ -216,16 +213,10 @@ class AddOrganizationTeamMember(PrivateViewMixin, OrganizationTeamMemberView, Fo
 
 
 class DeleteOrganizationTeamMember(
-    PrivateViewMixin, OrganizationTeamMemberView, DeleteView
+    PrivateViewMixin, OrganizationTeamMemberView, DeleteViewWithMessage
 ):
     success_message = _("Member removed from team")
     http_method_names = ["post"]
-
-    def post(self, request, *args, **kwargs):
-        """Hack to show messages on delete."""
-        resp = super().post(request, *args, **kwargs)
-        messages.success(self.request, self.success_message)
-        return resp
 
 
 class OrganizationSecurityLog(PrivateViewMixin, OrganizationMixin, ListView):

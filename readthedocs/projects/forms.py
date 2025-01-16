@@ -1,9 +1,12 @@
 """Project forms."""
+
 import json
 from random import choice
 from re import fullmatch
 from urllib.parse import urlparse
 
+import dns.name
+import dns.resolver
 from allauth.socialaccount.models import SocialAccount
 from django import forms
 from django.conf import settings
@@ -51,12 +54,86 @@ class ProjectForm(SimpleHistoryModelForm):
         self.user = kwargs.pop("user", None)
         super().__init__(*args, **kwargs)
 
+        self.fields["repo"].widget.attrs["placeholder"] = self.placehold_repo()
+        self.fields["repo"].widget.attrs["required"] = True
+
+        # NOTE: we are not using the default ModelChoiceField widget
+        # in order to use a list of choices instead of a queryset.
+        # See _get_remote_repository_choices for more info.
+        self.fields["remote_repository"] = forms.TypedChoiceField(
+            choices=self._get_remote_repository_choices(),
+            coerce=lambda x: RemoteRepository.objects.get(pk=x),
+            required=False,
+            empty_value=None,
+        )
+
+    def _get_remote_repository_choices(self):
+        """
+        Get valid choices for the remote repository field.
+
+        If there is a remote repo attached to the project,
+        we add it to the queryset, since the current user
+        might not have access to it.
+
+        .. note::
+
+           We are not including the current remote repo in the queryset
+           using an "or" condition, that confuses the ORM/postgres and
+           it results in a very slow query. Instead, we are using a list,
+           and adding the current remote repo to it.
+        """
+        queryset = RemoteRepository.objects.for_project_linking(self.user)
+        current_remote_repo = (
+            self.instance.remote_repository if self.instance.pk else None
+        )
+        options = [
+            (None, _("No connected repository")),
+        ]
+        if current_remote_repo and current_remote_repo not in queryset:
+            options.append((current_remote_repo.pk, str(current_remote_repo)))
+
+        options.extend((repo.pk, repo.clone_url) for repo in queryset)
+        return options
+
     def save(self, commit=True):
         project = super().save(commit)
         if commit:
             if self.user and not project.users.filter(pk=self.user.pk).exists():
                 project.users.add(self.user)
         return project
+
+    def clean_name(self):
+        name = self.cleaned_data.get("name", "")
+        if not self.instance.pk:
+            potential_slug = slugify(name)
+            if Project.objects.filter(slug=potential_slug).exists():
+                raise forms.ValidationError(
+                    _("Invalid project name, a project already exists with that name"),
+                )  # yapf: disable # noqa
+            if not potential_slug:
+                # Check the generated slug won't be empty
+                raise forms.ValidationError(
+                    _("Invalid project name"),
+                )
+
+        return name
+
+    def clean_repo(self):
+        repo = self.cleaned_data.get("repo", "")
+        return repo.rstrip("/")
+
+    def placehold_repo(self):
+        return choice(
+            [
+                "https://bitbucket.org/cherrypy/cherrypy",
+                "https://bitbucket.org/birkenfeld/sphinx",
+                "https://bitbucket.org/hpk42/tox",
+                "https://github.com/zzzeek/sqlalchemy.git",
+                "https://github.com/django/django.git",
+                "https://github.com/fabric/fabric.git",
+                "https://github.com/ericholscher/django-kong.git",
+            ]
+        )
 
 
 class ProjectTriggerBuildMixin:
@@ -95,6 +172,109 @@ class ProjectBackendForm(forms.Form):
     """Get the import backend."""
 
     backend = forms.CharField()
+
+
+class ProjectPRBuildsMixin(PrevalidatedForm):
+
+    """
+    Mixin that provides a method to setup the external builds option.
+
+    TODO: Remove this once we migrate to the new dashboard,
+    and we don't need to support the old project settings form.
+    """
+
+    def has_supported_integration(self, integrations):
+        supported_types = {Integration.GITHUB_WEBHOOK, Integration.GITLAB_WEBHOOK}
+        for integration in integrations:
+            if integration.integration_type in supported_types:
+                return True
+        return False
+
+    def can_build_external_versions(self, integrations):
+        """
+        Check if external versions can be enabled for this project.
+
+        A project can build external versions if:
+
+        - They are using GitHub or GitLab.
+        - The repository's webhook is setup to send pull request events.
+
+        If the integration's provider data isn't set,
+        it could mean that the user created the integration manually,
+        and doesn't have an account connected.
+        So we don't know for sure if the webhook is sending pull request events.
+        """
+        for integration in integrations:
+            provider_data = integration.provider_data
+            if integration.integration_type == Integration.GITHUB_WEBHOOK and (
+                not provider_data or "pull_request" in provider_data.get("events", [])
+            ):
+                return True
+            if integration.integration_type == Integration.GITLAB_WEBHOOK and (
+                not provider_data or provider_data.get("merge_requests_events")
+            ):
+                return True
+        return False
+
+    def setup_external_builds_option(self):
+        """Disable the external builds option if the project doesn't meet the requirements."""
+        if (
+            settings.ALLOW_PRIVATE_REPOS
+            and self.instance.remote_repository
+            and not self.instance.remote_repository.private
+        ):
+            self.fields["external_builds_privacy_level"].disabled = True
+            # TODO use a proper error/warning instead of help text for error states
+            help_text = _(
+                "We have detected that this project is public, pull request previews are set to public."
+            )
+            self.fields["external_builds_privacy_level"].help_text = help_text
+
+    def clean_prevalidation(self):
+        """Disable the external builds option if the project doesn't meet the requirements."""
+        integrations = list(self.instance.integrations.all())
+        has_supported_integration = self.has_supported_integration(integrations)
+        can_build_external_versions = self.can_build_external_versions(integrations)
+
+        # External builds are supported for this project,
+        # don't disable the option.
+        if has_supported_integration and can_build_external_versions:
+            return
+
+        msg = None
+        url = reverse("projects_integrations", args=[self.instance.slug])
+
+        if not has_supported_integration:
+            msg = _(
+                "To build from pull requests you need a "
+                f'GitHub or GitLab <a href="{url}">integration</a>.'
+            )
+
+        if has_supported_integration and not can_build_external_versions:
+            # If there is only one integration, link directly to it.
+            if len(integrations) == 1:
+                url = reverse(
+                    "projects_integrations_detail",
+                    args=[self.instance.slug, integrations[0].pk],
+                )
+            msg = _(
+                "To build from pull requests your repository's webhook "
+                "needs to send pull request events. "
+                f'Try to <a href="{url}">resync your integration</a>.'
+            )
+
+        if msg:
+            # TODO use a proper error/warning instead of help text for error states
+            field = self.fields["external_builds_enabled"]
+            field.disabled = True
+            field.help_text = f"{msg} {field.help_text}"
+            # Don't raise an error on the Update form,
+            # to keep backwards compat
+            if not self.fields.get("name"):
+                raise RichValidationError(
+                    msg,
+                    header=_("Pull request builds not supported"),
+                )
 
 
 class ProjectFormPrevalidateMixin:
@@ -209,74 +389,13 @@ class ProjectBasicsForm(ProjectForm):
 
     class Meta:
         model = Project
-        fields = ("name", "repo", "default_branch", "language")
-
-    remote_repository = forms.IntegerField(
-        widget=forms.HiddenInput(),
-        required=False,
-    )
+        fields = ("name", "repo", "default_branch", "language", "remote_repository")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["repo"].widget.attrs["placeholder"] = self.placehold_repo()
         self.fields["repo"].widget.attrs["required"] = True
-
-    def save(self, commit=True):
-        """Add remote repository relationship to the project instance."""
-        instance = super().save(commit)
-        remote_repo = self.cleaned_data.get("remote_repository", None)
-        if remote_repo:
-            if commit:
-                remote_repo.projects.add(self.instance)
-                remote_repo.save()
-            else:
-                instance.remote_repository = remote_repo
-        return instance
-
-    def clean_name(self):
-        name = self.cleaned_data.get("name", "")
-        if not self.instance.pk:
-            potential_slug = slugify(name)
-            if Project.objects.filter(slug=potential_slug).exists():
-                raise forms.ValidationError(
-                    _("Invalid project name, a project already exists with that name"),
-                )  # yapf: disable # noqa
-            if not potential_slug:
-                # Check the generated slug won't be empty
-                raise forms.ValidationError(
-                    _("Invalid project name"),
-                )
-
-        return name
-
-    def clean_repo(self):
-        repo = self.cleaned_data.get("repo", "")
-        return repo.rstrip("/")
-
-    def clean_remote_repository(self):
-        remote_repo = self.cleaned_data.get("remote_repository", None)
-        if not remote_repo:
-            return None
-        try:
-            return RemoteRepository.objects.get(
-                pk=remote_repo,
-                users=self.user,
-            )
-        except RemoteRepository.DoesNotExist as exc:
-            raise forms.ValidationError(_("Repository invalid")) from exc
-
-    def placehold_repo(self):
-        return choice(
-            [
-                "https://bitbucket.org/cherrypy/cherrypy",
-                "https://bitbucket.org/birkenfeld/sphinx",
-                "https://bitbucket.org/hpk42/tox",
-                "https://github.com/zzzeek/sqlalchemy.git",
-                "https://github.com/django/django.git",
-                "https://github.com/fabric/fabric.git",
-                "https://github.com/ericholscher/django-kong.git",
-            ]
-        )
+        self.fields["remote_repository"].widget = forms.HiddenInput()
 
 
 class ProjectConfigForm(forms.Form):
@@ -291,7 +410,8 @@ class ProjectConfigForm(forms.Form):
 
 class UpdateProjectForm(
     ProjectTriggerBuildMixin,
-    ProjectBasicsForm,
+    ProjectForm,
+    ProjectPRBuildsMixin,
 ):
 
     """Main project settings form."""
@@ -302,30 +422,32 @@ class UpdateProjectForm(
             # Basics and repo settings
             "name",
             "repo",
-            "repo_type",
-            "default_branch",
+            "remote_repository",
             "language",
-            "description",
-            # Project related settings
             "default_version",
             "privacy_level",
             "versioning_scheme",
-            "external_builds_enabled",
-            "external_builds_privacy_level",
+            "default_branch",
             "readthedocs_yaml_path",
-            "analytics_code",
-            "analytics_disabled",
-            "show_version_warning",
             # Meta data
             "programming_language",
             "project_url",
+            "description",
             "tags",
+            # Booleans
+            "external_builds_privacy_level",
+            "external_builds_enabled",
+            # Deprecated
+            "analytics_code",
+            "analytics_disabled",
+            "show_version_warning",
         )
 
+    # Make description smaller, only a CharField
     description = forms.CharField(
         required=False,
         max_length=150,
-        widget=forms.Textarea,
+        help_text=_("Short description of this project"),
     )
 
     def __init__(self, *args, **kwargs):
@@ -361,6 +483,11 @@ class UpdateProjectForm(
             for field in ["privacy_level", "external_builds_privacy_level"]:
                 self.fields.pop(field)
 
+        # Remove analytics from new dashboard
+        if settings.RTD_EXT_THEME_ENABLED:
+            for field in ["analytics_code", "analytics_disabled"]:
+                self.fields.pop(field)
+
         default_choice = (None, "-" * 9)
         versions_choices = (
             self.instance.versions(manager=INTERNAL)
@@ -382,86 +509,6 @@ class UpdateProjectForm(
             self.fields["default_version"].widget.attrs["readonly"] = True
 
         self.setup_external_builds_option()
-
-    def setup_external_builds_option(self):
-        """Disable the external builds option if the project doesn't meet the requirements."""
-        if (
-            settings.ALLOW_PRIVATE_REPOS
-            and self.instance.remote_repository
-            and not self.instance.remote_repository.private
-        ):
-            self.fields["external_builds_privacy_level"].disabled = True
-            help_text = _(
-                "We have detected that this project is public, pull request previews are set to public."
-            )
-            self.fields["external_builds_privacy_level"].help_text = help_text
-
-        integrations = list(self.instance.integrations.all())
-        has_supported_integration = self.has_supported_integration(integrations)
-        can_build_external_versions = self.can_build_external_versions(integrations)
-
-        # External builds are supported for this project,
-        # don't disable the option.
-        if has_supported_integration and can_build_external_versions:
-            return
-
-        msg = None
-        url = reverse("projects_integrations", args=[self.instance.slug])
-        if not has_supported_integration:
-            msg = _(
-                "To build from pull requests you need a "
-                f'GitHub or GitLab <a href="{url}">integration</a>.'
-            )
-        if has_supported_integration and not can_build_external_versions:
-            # If there is only one integration, link directly to it.
-            if len(integrations) == 1:
-                url = reverse(
-                    "projects_integrations_detail",
-                    args=[self.instance.slug, integrations[0].pk],
-                )
-            msg = _(
-                "To build from pull requests your repository's webhook "
-                "needs to send pull request events. "
-                f'Try to <a href="{url}">resync your integration</a>.'
-            )
-
-        if msg:
-            field = self.fields["external_builds_enabled"]
-            field.disabled = True
-            field.help_text = f"{msg} {field.help_text}"
-
-    def has_supported_integration(self, integrations):
-        supported_types = {Integration.GITHUB_WEBHOOK, Integration.GITLAB_WEBHOOK}
-        for integration in integrations:
-            if integration.integration_type in supported_types:
-                return True
-        return False
-
-    def can_build_external_versions(self, integrations):
-        """
-        Check if external versions can be enabled for this project.
-
-        A project can build external versions if:
-
-        - They are using GitHub or GitLab.
-        - The repository's webhook is setup to send pull request events.
-
-        If the integration's provider data isn't set,
-        it could mean that the user created the integration manually,
-        and doesn't have an account connected.
-        So we don't know for sure if the webhook is sending pull request events.
-        """
-        for integration in integrations:
-            provider_data = integration.provider_data
-            if integration.integration_type == Integration.GITHUB_WEBHOOK and (
-                not provider_data or "pull_request" in provider_data.get("events", [])
-            ):
-                return True
-            if integration.integration_type == Integration.GITLAB_WEBHOOK and (
-                not provider_data or provider_data.get("merge_requests_events")
-            ):
-                return True
-        return False
 
     def clean_readthedocs_yaml_path(self):
         """
@@ -574,9 +621,27 @@ class ProjectRelationshipForm(forms.ModelForm):
         return alias
 
 
+class ProjectPullRequestForm(forms.ModelForm, ProjectPRBuildsMixin):
+
+    """Project pull requests configuration form."""
+
+    class Meta:
+        model = Project
+        fields = ["external_builds_enabled", "external_builds_privacy_level"]
+
+    def __init__(self, *args, **kwargs):
+        self.project = kwargs.pop("project", None)
+        super().__init__(*args, **kwargs)
+
+        self.setup_external_builds_option()
+
+        if not settings.ALLOW_PRIVATE_REPOS:
+            self.fields.pop("external_builds_privacy_level")
+
+
 class AddonsConfigForm(forms.ModelForm):
 
-    """Form to opt-in into new beta addons."""
+    """Form to opt-in into new addons."""
 
     project = forms.CharField(widget=forms.HiddenInput(), required=False)
 
@@ -585,42 +650,50 @@ class AddonsConfigForm(forms.ModelForm):
         fields = (
             "enabled",
             "project",
+            "options_root_selector",
             "analytics_enabled",
             "doc_diff_enabled",
-            "doc_diff_root_selector",
-            "external_version_warning_enabled",
             "flyout_enabled",
             "flyout_sorting",
             "flyout_sorting_latest_stable_at_beginning",
             "flyout_sorting_custom_pattern",
+            "flyout_position",
             "hotkeys_enabled",
             "search_enabled",
-            "stable_latest_version_warning_enabled",
+            "linkpreviews_enabled",
+            "notifications_enabled",
+            "notifications_show_on_latest",
+            "notifications_show_on_non_stable",
+            "notifications_show_on_external",
         )
         labels = {
             "enabled": _("Enable Addons"),
-            "external_version_warning_enabled": _(
+            "doc_diff_enabled": _("Visual diff enabled"),
+            "notifications_show_on_external": _(
                 "Show a notification on builds from pull requests"
             ),
-            "stable_latest_version_warning_enabled": _(
-                "Show a notification on non-stable and latest versions"
+            "notifications_show_on_non_stable": _(
+                "Show a notification on non-stable versions"
             ),
+            "notifications_show_on_latest": _("Show a notification on latest version"),
+            "linkpreviews_enabled": _("Enabled"),
+            "options_root_selector": _("CSS main content selector"),
         }
+
         widgets = {
-            "doc_diff_root_selector": forms.TextInput(
+            "options_root_selector": forms.TextInput(
                 attrs={"placeholder": "[role=main]"}
             ),
         }
 
     def __init__(self, *args, **kwargs):
         self.project = kwargs.pop("project", None)
-        addons, created = AddonsConfig.objects.get_or_create(project=self.project)
-        if created:
-            addons.enabled = False
-            addons.save()
-
-        kwargs["instance"] = addons
+        kwargs["instance"] = self.project.addons
         super().__init__(*args, **kwargs)
+
+        # Keep the ability to disable addons completely on Read the Docs for Business
+        if not settings.RTD_ALLOW_ORGANIZATIONS:
+            self.fields["enabled"].disabled = True
 
     def clean(self):
         if (
@@ -923,11 +996,11 @@ class DomainForm(forms.ModelForm):
     def clean_domain(self):
         """Validates domain."""
         domain = self.cleaned_data["domain"].lower()
-        parsed = urlparse(domain)
+        parsed = self._safe_urlparse(domain)
 
         # Force the scheme to have a valid netloc.
         if not parsed.scheme:
-            parsed = urlparse(f"https://{domain}")
+            parsed = self._safe_urlparse(f"https://{domain}")
 
         if not parsed.netloc:
             raise forms.ValidationError(f"{domain} is not a valid domain.")
@@ -946,7 +1019,79 @@ class DomainForm(forms.ModelForm):
             if invalid_domain and domain_string.endswith(invalid_domain):
                 raise forms.ValidationError(f"{invalid_domain} is not a valid domain.")
 
+        self._check_for_suspicious_cname(domain_string)
+
         return domain_string
+
+    def _check_for_suspicious_cname(self, domain):
+        """
+        Check if a domain has a suspicious CNAME record.
+
+        The domain is suspicious if:
+
+        - Has a CNAME pointing to another CNAME.
+          This prevents the subdomain from being hijacked if the last subdomain is on RTD,
+          but the user didn't register the other subdomain.
+          Example: doc.example.com -> docs.example.com -> readthedocs.io,
+          We don't want to allow doc.example.com to be added.
+        - Has a CNAME pointing to the APEX domain.
+          This prevents a subdomain from being hijacked if the APEX domain is on RTD.
+          A common case is `www` pointing to the APEX domain, but users didn't register the
+          `www` subdomain, only the APEX domain.
+          Example: www.example.com -> example.com -> readthedocs.io,
+          we don't want to allow www.example.com to be added.
+        """
+        cname = self._get_cname(domain)
+        # Doesn't have a CNAME record, we are good.
+        if not cname:
+            return
+
+        # If the domain has a CNAME pointing to the APEX domain, that's not good.
+        # This check isn't perfect, but it's a good enoug heuristic
+        # to dectect CNAMES like www.example.com -> example.com.
+        if f"{domain}.".endswith(f".{cname}"):
+            raise forms.ValidationError(
+                _(
+                    "This domain has a CNAME record pointing to the APEX domain. "
+                    "Please remove the CNAME before adding the domain.",
+                ),
+            )
+
+        second_cname = self._get_cname(cname)
+        # The domain has a CNAME pointing to another CNAME, That's not good.
+        if second_cname:
+            raise forms.ValidationError(
+                _(
+                    "This domain has a CNAME record pointing to another CNAME. "
+                    "Please remove the CNAME before adding the domain.",
+                ),
+            )
+
+    def _get_cname(self, domain):
+        try:
+            answers = dns.resolver.resolve(domain, "CNAME", lifetime=1)
+            # dnspython doesn't recursively resolve CNAME records.
+            # We always have one response or none.
+            return str(answers[0].target)
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+            return None
+        except dns.resolver.LifetimeTimeout:
+            raise forms.ValidationError(
+                _(
+                    "DNS resolution timed out. Make sure the domain is correct, or try again later."
+                ),
+            )
+        except dns.name.EmptyLabel:
+            raise forms.ValidationError(
+                _("The domain is not valid."),
+            )
+
+    def _safe_urlparse(self, url):
+        """Wrapper around urlparse to throw ValueError exceptions as ValidationError."""
+        try:
+            return urlparse(url)
+        except ValueError:
+            raise forms.ValidationError("Invalid domain")
 
     def clean_canonical(self):
         canonical = self.cleaned_data["canonical"]
